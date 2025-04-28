@@ -1,0 +1,30 @@
+# Build directory
+build/
+
+# VS Code settings
+.vscode/
+
+# ESP-IDF default ignores
+sdkconfig
+sdkconfig.old
+
+# Prerequisites
+*.d
+
+# Object files
+*.o
+
+# Libraries
+*.lib
+*.a
+
+# Executables
+*.exe
+*.out
+*.app
+*.i*86
+*.x86_64
+*.hex
+
+# Debug files
+*.dSYM/
