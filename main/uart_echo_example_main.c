@@ -230,6 +230,21 @@ static void blink_task(void *arg) {
 
 //——— TASKS ———
 
+// ——— Example task: print every 500 ms ———
+static void ultrasonic_task(void *arg) {
+    char buffer[32];  // Buffer for formatting the UART message
+    while (1) {
+        float d = ultrasonic_read_cm();
+        if (d < 0) {
+            snprintf(buffer, sizeof(buffer), "U:ERR:%.1f\r\n", d);
+        } else {
+            snprintf(buffer, sizeof(buffer), "U:%.1f\r\n", d);
+        }
+        uart_write_bytes(ECHO_UART_PORT_NUM, buffer, strlen(buffer));
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+
 static void echo_task(void *arg) { // TODO: UPDATE TO PROPERLY SEND NEW COMMANDS W LABVIEW
     // 1) Configure and install UART driver
     uart_config_t uart_config = {
@@ -277,6 +292,11 @@ static void echo_task(void *arg) { // TODO: UPDATE TO PROPERLY SEND NEW COMMANDS
                     gpio_set_level(GPIO_NUM_13, 0);
                     uart_write_bytes(ECHO_UART_PORT_NUM, "LED OFF\r\n", strlen("LED OFF\r\n"));
                     break;
+
+                case 'R':
+                    //Start ultrasonic task?
+                    xTaskCreate(ultrasonic_task, "ultra", 2048, NULL, 5, NULL);
+
                 default:
                     // ignore other commands
                     break;
@@ -285,18 +305,6 @@ static void echo_task(void *arg) { // TODO: UPDATE TO PROPERLY SEND NEW COMMANDS
     }
 }
 
-// ——— Example task: print every 500 ms ———
-static void ultrasonic_task(void *arg) {
-    while (1) {
-        float d = ultrasonic_read_cm();
-        if (d < 0) {
-            printf("Ultrasonic: no reading (err=%.1f)\n", d);
-        } else {
-            printf("Ultrasonic: %.1f cm\n", d);
-        }
-        vTaskDelay(pdMS_TO_TICKS(500));
-    }
-}
 
 void app_main(void) {
 
@@ -307,8 +315,8 @@ void app_main(void) {
     ultrasonic_init();
 
     // Launch the UART echo / command task
-    // xTaskCreate(echo_task, "uart_echo_task", ECHO_TASK_STACK_SIZE, NULL, 10, NULL);
+    xTaskCreate(echo_task, "uart_echo_task", ECHO_TASK_STACK_SIZE, NULL, 10, NULL);
 
     // 3) Launch the ultrasonic measurement task
-    xTaskCreate(ultrasonic_task, "ultra", 2048, NULL, 5, NULL);
+    // xTaskCreate(ultrasonic_task, "ultra", 2048, NULL, 5, NULL);
 }
