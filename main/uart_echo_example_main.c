@@ -1,11 +1,5 @@
-/* UART Echo Example
+/* uart_echo_example_main.c  -- Modified for A/B LED control + case 'I' handshake */
 
-   This example code is in the Public Domain (or CC0 licensed, at your option.)
-
-   Unless required by applicable law or agreed to in writing, this
-   software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-   CONDITIONS OF ANY KIND, either express or implied.
-*/
 #include <stdio.h>
 #include "string.h"
 #include "freertos/FreeRTOS.h"
@@ -15,60 +9,15 @@
 #include "sdkconfig.h"
 #include "esp_log.h"
 
-/**
- * This is an example which echos any data it receives on configured UART back to the sender,
- * with hardware flow control turned off. It does not use UART driver event queue.
- *
- * - Port: configured UART
- * - Receive (Rx) buffer: on
- * - Transmit (Tx) buffer: off
- * - Flow control: off
- * - Event queue: off
- * - Pin assignment: see defines below (See Kconfig)
- */
+#define ECHO_TEST_TXD        (CONFIG_EXAMPLE_UART_TXD)
+#define ECHO_TEST_RXD        (CONFIG_EXAMPLE_UART_RXD)
+#define ECHO_UART_PORT_NUM   (CONFIG_EXAMPLE_UART_PORT_NUM)
+#define ECHO_UART_BAUD_RATE  (CONFIG_EXAMPLE_UART_BAUD_RATE)
+#define ECHO_TASK_STACK_SIZE (CONFIG_EXAMPLE_TASK_STACK_SIZE)
+#define BUF_SIZE             (1024)
 
-#define ECHO_TEST_TXD (CONFIG_EXAMPLE_UART_TXD)
-#define ECHO_TEST_RXD (CONFIG_EXAMPLE_UART_RXD)
-#define ECHO_TEST_RTS (UART_PIN_NO_CHANGE)
-#define ECHO_TEST_CTS (UART_PIN_NO_CHANGE)
-
-#define ECHO_UART_PORT_NUM      (CONFIG_EXAMPLE_UART_PORT_NUM)
-#define ECHO_UART_BAUD_RATE     (CONFIG_EXAMPLE_UART_BAUD_RATE)
-#define ECHO_TASK_STACK_SIZE    (CONFIG_EXAMPLE_TASK_STACK_SIZE)
-
-#define DEFAULT_PERIOD 10
-
-static uint8_t s_led_state = 1;
-
-static uint32_t flash_period = DEFAULT_PERIOD;
-static uint32_t flash_period_dec = DEFAULT_PERIOD/10;
-
-
-TaskHandle_t myTaskHandle = NULL;
-
-#define BUF_SIZE (1024)
-
-static void blink_led(void)
-{
-    /* Set the GPIO level according to the state (LOW or HIGH)*/
-    gpio_set_level(13, s_led_state);
-}
-
-static void blink_task(void *arg)
-{
-    while(1)
-    {
-    s_led_state = !s_led_state;
-    blink_led();
-    vTaskDelay(flash_period/ portTICK_PERIOD_MS);
-    }
-
-}
-
-static void echo_task(void *arg)
-{
-    /* Configure parameters of an UART driver,
-     * communication pins and install the driver */
+static void echo_task(void *arg) {
+    // 1) Configure and install UART driver
     uart_config_t uart_config = {
         .baud_rate = ECHO_UART_BAUD_RATE,
         .data_bits = UART_DATA_8_BITS,
@@ -77,64 +26,57 @@ static void echo_task(void *arg)
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
         .source_clk = UART_SCLK_DEFAULT,
     };
-    int intr_alloc_flags = 0;
-
-#if CONFIG_UART_ISR_IN_IRAM
-    intr_alloc_flags = ESP_INTR_FLAG_IRAM;
-#endif
-
-    ESP_ERROR_CHECK(uart_driver_install(ECHO_UART_PORT_NUM, BUF_SIZE * 2, 0, 0, NULL, intr_alloc_flags));
+    ESP_ERROR_CHECK(uart_driver_install(ECHO_UART_PORT_NUM, BUF_SIZE * 2, 0, 0, NULL, 0));
     ESP_ERROR_CHECK(uart_param_config(ECHO_UART_PORT_NUM, &uart_config));
-    ESP_ERROR_CHECK(uart_set_pin(ECHO_UART_PORT_NUM, ECHO_TEST_TXD, ECHO_TEST_RXD, ECHO_TEST_RTS, ECHO_TEST_CTS));
+    ESP_ERROR_CHECK(uart_set_pin(ECHO_UART_PORT_NUM, ECHO_TEST_TXD, ECHO_TEST_RXD, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
 
-    // Configure a temporary buffer for the incoming data
-    uint8_t *data = (uint8_t *) malloc(BUF_SIZE);
+    // 2) Allocate buffer for incoming data
+    uint8_t *data = malloc(BUF_SIZE);
+    if (!data) {
+        ESP_LOGE("echo_task", "Buffer allocation failed");
+        vTaskDelete(NULL);
+        return;
+    }
 
+    // 3) Send handshake so LabVIEW can detect connection
     uart_write_bytes(ECHO_UART_PORT_NUM, "Commands", strlen("Commands"));
-    while (1)
-    {
-        // Read data from the UART
-        int len = uart_read_bytes(ECHO_UART_PORT_NUM, data, (BUF_SIZE - 1), 20 / portTICK_PERIOD_MS);
-        // Write data back to the UART
-        uart_write_bytes(ECHO_UART_PORT_NUM, (const char *) data, len);
-        if (len)
-        {
-            data[len] = '\0';
-            switch(data[0])
-            {
+
+    // 4) Main loop: read → interpret
+    while (1) {
+        int len = uart_read_bytes(ECHO_UART_PORT_NUM, data, BUF_SIZE - 1, 20 / portTICK_PERIOD_MS);
+        if (len > 0) {
+            data[len] = '\0';  // null-terminate
+
+            switch (data[0]) {
                 case 'I':
-                    s_led_state = 1;
-                    blink_led();
-                    uart_write_bytes(ECHO_UART_PORT_NUM, "ESP32", strlen("ESP32"));
-                    break;
-                case 'T':
-                    flash_period -= flash_period_dec;
-                    if(flash_period <= flash_period_dec) flash_period = flash_period_dec;
+                    // Connection initialization: LED on + respond
+                    gpio_set_level(GPIO_NUM_13, 1);
+                    uart_write_bytes(ECHO_UART_PORT_NUM, "ESP32\r\n", strlen("ESP32\r\n"));
                     break;
                 case 'A':
-                    vTaskResume(myTaskHandle);
+                    // Turn LED13 ON
+                    gpio_set_level(GPIO_NUM_13, 1);
+                    uart_write_bytes(ECHO_UART_PORT_NUM, "LED ON\r\n", strlen("LED ON\r\n"));
                     break;
                 case 'B':
-                    vTaskSuspend(myTaskHandle);
-                    break;
-                case 'R':
-                    flash_period = DEFAULT_PERIOD;
+                    // Turn LED13 OFF
+                    gpio_set_level(GPIO_NUM_13, 0);
+                    uart_write_bytes(ECHO_UART_PORT_NUM, "LED OFF\r\n", strlen("LED OFF\r\n"));
                     break;
                 default:
+                    // ignore other commands
                     break;
             }
         }
     }
 }
 
-void app_main(void)
-{
-    gpio_reset_pin(13);
-    /* Set the GPIO as a push/pull output */
-    gpio_set_direction(13, GPIO_MODE_OUTPUT);
-    blink_led();
+void app_main(void) {
+    // Initialize GPIO13 for on-board LED
+    gpio_reset_pin(GPIO_NUM_13);
+    gpio_set_direction(GPIO_NUM_13, GPIO_MODE_OUTPUT);
+    gpio_set_level(GPIO_NUM_13, 0);  // LED starts OFF
 
+    // Launch the UART echo / command task
     xTaskCreate(echo_task, "uart_echo_task", ECHO_TASK_STACK_SIZE, NULL, 10, NULL);
-    xTaskCreate(blink_task, "blink_LED", 1024, NULL, 5, &myTaskHandle);
-    vTaskSuspend(myTaskHandle);
 }
