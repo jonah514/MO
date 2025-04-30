@@ -6,317 +6,384 @@
 #include "freertos/task.h"
 #include "driver/uart.h"
 #include "driver/gpio.h"
-#include "sdkconfig.h"
 #include "driver/ledc.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_random.h"
 #include "esp_timer.h"
+#include "sdkconfig.h"
 
 // UART CONFIG, DONT CHANGE
-#define ECHO_TEST_TXD        (CONFIG_EXAMPLE_UART_TXD)
-#define ECHO_TEST_RXD        (CONFIG_EXAMPLE_UART_RXD)
-#define ECHO_UART_PORT_NUM   (CONFIG_EXAMPLE_UART_PORT_NUM)
-#define ECHO_UART_BAUD_RATE  (CONFIG_EXAMPLE_UART_BAUD_RATE)
-#define ECHO_TASK_STACK_SIZE (CONFIG_EXAMPLE_TASK_STACK_SIZE)
-#define BUF_SIZE             (1024)
+#define UART_TX_PIN         (CONFIG_EXAMPLE_UART_TXD)
+#define UART_RX_PIN         (CONFIG_EXAMPLE_UART_RXD)
+#define UART_PORT_NUM       (CONFIG_EXAMPLE_UART_PORT_NUM)
+#define UART_BAUD_RATE      (CONFIG_EXAMPLE_UART_BAUD_RATE)
+#define UART_BUF_SIZE       (1024)
+#define UART_TASK_STACK     (CONFIG_EXAMPLE_TASK_STACK_SIZE)
 
-// LED heartbeat
-static uint8_t  s_led_state    = 1;
-static uint32_t flash_period   = 1000;
-static uint32_t flash_period_dec = 100;
-TaskHandle_t    myTaskHandle   = NULL;
+//— pins & PWM for servo ————————————————————————————
+#define SERVO_GPIO1         GPIO_NUM_12
+#define SERVO_GPIO2         GPIO_NUM_13
+#define SERVO_FREQ_HZ       50
+#define SERVO_TIMER         LEDC_TIMER_0
+#define SERVO_CHANNEL_1     LEDC_CHANNEL_0
+#define SERVO_CHANNEL_2     LEDC_CHANNEL_1
+#define SERVO_MIN_US        500
+#define SERVO_MAX_US        2500
+#define SERVO_MAX_DEG       180
 
-// Servo PWM
-#define SERVO_GPIO1         12
-#define SERVO_GPIO2         13
-#define SERVO_PWM_FREQUENCY 50
-#define SERVO_PWM_TIMER     LEDC_TIMER_0
-#define SERVO_PWM_CHANNEL_1 LEDC_CHANNEL_0
-#define SERVO_PWM_CHANNEL_2 LEDC_CHANNEL_1
-#define SERVO_MIN_PULSEWIDTH_US 500
-#define SERVO_MAX_PULSEWIDTH_US 2500
-#define SERVO_MAX_DEGREE         180
+//— motor GPIOs ——————————————————————————————————————
+#define MOTOR_A_IN1         GPIO_NUM_7
+#define MOTOR_A_IN2         GPIO_NUM_8
+#define MOTOR_B_IN3         GPIO_NUM_26
+#define MOTOR_B_IN4         GPIO_NUM_25
 
-// Motor GPIOs
-#define MOTOR_A_IN1_GPIO  GPIO_NUM_7
-#define MOTOR_A_IN2_GPIO  GPIO_NUM_8
-#define MOTOR_B_IN3_GPIO  GPIO_NUM_26
-#define MOTOR_B_IN4_GPIO  GPIO_NUM_25
+//— ultrasonic pins ————————————————————————————————
+#define ULTRA_TRIG_PIN      GPIO_NUM_4
+#define ULTRA_ECHO_PIN      GPIO_NUM_15
 
-#define ULTRASONIC_TRIG_PIN GPIO_NUM_4    // Feather pin “4” / A5
-#define ULTRASONIC_ECHO_PIN GPIO_NUM_15   // Feather pin “15”/ A8
 
-//——— INITIALIZATION FUNCTIONS ———
+//— modes ————————————————————————————————————————
+typedef enum {
+    MODE_REMOTE = 0,
+    MODE_RANDOM = 1,
+    MODE_VOICE  = 2
+} operation_mode_t;
+static volatile operation_mode_t current_mode = MODE_REMOTE;
+
+//— shared distance (cm) updated by timer callback ———————————
+static volatile float g_ultrasonic_cm = -1.0f;
+
+// Count how many times MO has bumped into something
+static volatile uint32_t obstacle_count = 0;
+
+//— task handles —————————————————————————————————————
+static TaskHandle_t randomTaskHandle = NULL;
+static TaskHandle_t voiceTaskHandle  = NULL;
+
+
+//———————————————————————————————————————————————
+//— Initialization routines
+//———————————————————————————————————————————————
 
 static void init_led(void) {
     gpio_reset_pin(GPIO_NUM_13);
     gpio_set_direction(GPIO_NUM_13, GPIO_MODE_OUTPUT);
-    gpio_set_level(GPIO_NUM_13, s_led_state);
+    gpio_set_level(GPIO_NUM_13, 0);
 }
 
 static void init_servo(void) {
     // timer
-    ledc_timer_config_t timer_cfg = {
+    ledc_timer_config_t t = {
         .speed_mode       = LEDC_LOW_SPEED_MODE,
-        .timer_num        = SERVO_PWM_TIMER,
+        .timer_num        = SERVO_TIMER,
         .duty_resolution  = LEDC_TIMER_13_BIT,
-        .freq_hz          = SERVO_PWM_FREQUENCY,
+        .freq_hz          = SERVO_FREQ_HZ,
         .clk_cfg          = LEDC_AUTO_CLK,
     };
-    ledc_timer_config(&timer_cfg);
-    // channel 1
-    ledc_channel_config_t ch1 = {
-        .speed_mode = LEDC_LOW_SPEED_MODE,
-        .channel    = SERVO_PWM_CHANNEL_1,
-        .timer_sel  = SERVO_PWM_TIMER,
-        .intr_type  = LEDC_INTR_DISABLE,
-        .gpio_num   = SERVO_GPIO1,
-        .duty       = 0,
-        .hpoint     = 0,
-    };
-    ledc_channel_config(&ch1);
-    // channel 2
-    ledc_channel_config_t ch2 = {
-        .speed_mode = LEDC_LOW_SPEED_MODE,
-        .channel    = SERVO_PWM_CHANNEL_2,
-        .timer_sel  = SERVO_PWM_TIMER,
-        .intr_type  = LEDC_INTR_DISABLE,
-        .gpio_num   = SERVO_GPIO2,
-        .duty       = 0,
-        .hpoint     = 0,
-    };
-    ledc_channel_config(&ch2);
+    ledc_timer_config(&t);
+
+    for (int ch = SERVO_CHANNEL_1; ch <= SERVO_CHANNEL_2; ch++) {
+        ledc_channel_config_t c = {
+            .speed_mode = LEDC_LOW_SPEED_MODE,
+            .channel    = ch,
+            .timer_sel  = SERVO_TIMER,
+            .intr_type  = LEDC_INTR_DISABLE,
+            .gpio_num   = (ch == SERVO_CHANNEL_1 ? SERVO_GPIO1 : SERVO_GPIO2),
+            .duty       = 0,
+            .hpoint     = 0
+        };
+        ledc_channel_config(&c);
+    }
 }
 
 static void init_motor(void) {
-    gpio_set_direction(MOTOR_A_IN1_GPIO, GPIO_MODE_OUTPUT);
-    gpio_set_direction(MOTOR_A_IN2_GPIO, GPIO_MODE_OUTPUT);
-    gpio_set_direction(MOTOR_B_IN3_GPIO, GPIO_MODE_OUTPUT);
-    gpio_set_direction(MOTOR_B_IN4_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_direction(MOTOR_A_IN1, GPIO_MODE_OUTPUT);
+    gpio_set_direction(MOTOR_A_IN2, GPIO_MODE_OUTPUT);
+    gpio_set_direction(MOTOR_B_IN3, GPIO_MODE_OUTPUT);
+    gpio_set_direction(MOTOR_B_IN4, GPIO_MODE_OUTPUT);
     // ensure stopped
-    gpio_set_level(MOTOR_A_IN1_GPIO, 0);
-    gpio_set_level(MOTOR_A_IN2_GPIO, 0);
-    gpio_set_level(MOTOR_B_IN3_GPIO, 0);
-    gpio_set_level(MOTOR_B_IN4_GPIO, 0);
+    gpio_set_level(MOTOR_A_IN1, 0);
+    gpio_set_level(MOTOR_A_IN2, 0);
+    gpio_set_level(MOTOR_B_IN3, 0);
+    gpio_set_level(MOTOR_B_IN4, 0);
 }
 
-static void ultrasonic_init(void) {
-    // TRIG = output, start low
-    gpio_reset_pin(ULTRASONIC_TRIG_PIN);
-    gpio_set_direction(ULTRASONIC_TRIG_PIN, GPIO_MODE_OUTPUT);
-    gpio_set_level(ULTRASONIC_TRIG_PIN, 0);
-    
-    gpio_reset_pin(ULTRASONIC_ECHO_PIN);
-    gpio_set_direction(ULTRASONIC_ECHO_PIN, GPIO_MODE_INPUT);
+static void init_ultrasonic(void) {
+    gpio_reset_pin(ULTRA_TRIG_PIN);
+    gpio_set_direction(ULTRA_TRIG_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_level(ULTRA_TRIG_PIN, 0);
+
+    gpio_reset_pin(ULTRA_ECHO_PIN);
+    gpio_set_direction(ULTRA_ECHO_PIN, GPIO_MODE_INPUT);
 }
 
 
 //——— SERVO HELPERS ———
 
-static uint32_t servo_angle_to_duty_us(int angle) {
-    return SERVO_MIN_PULSEWIDTH_US +
-        ((SERVO_MAX_PULSEWIDTH_US - SERVO_MIN_PULSEWIDTH_US) * angle) / SERVO_MAX_DEGREE;
+static uint32_t angle_to_duty(int angle) {
+    return SERVO_MIN_US +
+         ((SERVO_MAX_US - SERVO_MIN_US) * angle) / SERVO_MAX_DEG;
 }
 
-static void set_servo_angle(int channel, int angle) {
-    uint32_t duty_us = servo_angle_to_duty_us(angle);
-    uint32_t duty = (duty_us * (1 << 13)) / (1000000 / SERVO_PWM_FREQUENCY);
+static void set_servo(int channel, int angle) {
+    uint32_t us = angle_to_duty(angle);
+    uint32_t duty = (us * (1 << 13)) / (1000000 / SERVO_FREQ_HZ);
     ledc_set_duty(LEDC_LOW_SPEED_MODE, channel, duty);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, channel);
 }
 
-static void move_servo_smooth(int channel, int start_angle, int end_angle, int delay_ms) {
-    int step = (end_angle > start_angle) ? 1 : -1;
-    for (int a = start_angle; a != end_angle; a += step) {
-        set_servo_angle(channel, a);
-        vTaskDelay(pdMS_TO_TICKS(delay_ms));
-    }
-    set_servo_angle(channel, end_angle);
-}
 
-
-//——— MOTOR PRIMITIVES ———
+//———————————————————————————————————————————————
+//— Motor primitives
+//———————————————————————————————————————————————
 
 static void motor_forward(void) {
-    gpio_set_level(MOTOR_A_IN1_GPIO, 1);
-    gpio_set_level(MOTOR_A_IN2_GPIO, 0);
-    gpio_set_level(MOTOR_B_IN3_GPIO, 1);
-    gpio_set_level(MOTOR_B_IN4_GPIO, 0);
+    gpio_set_level(MOTOR_A_IN1, 1);
+    gpio_set_level(MOTOR_A_IN2, 0);
+    gpio_set_level(MOTOR_B_IN3, 1);
+    gpio_set_level(MOTOR_B_IN4, 0);
 }
-
 static void motor_reverse(void) {
-    gpio_set_level(MOTOR_A_IN1_GPIO, 0);
-    gpio_set_level(MOTOR_A_IN2_GPIO, 1);
-    gpio_set_level(MOTOR_B_IN3_GPIO, 0);
-    gpio_set_level(MOTOR_B_IN4_GPIO, 1);
+    gpio_set_level(MOTOR_A_IN1, 0);
+    gpio_set_level(MOTOR_A_IN2, 1);
+    gpio_set_level(MOTOR_B_IN3, 0);
+    gpio_set_level(MOTOR_B_IN4, 1);
 }
-
 static void motor_left(void) {
-    gpio_set_level(MOTOR_A_IN1_GPIO, 0);
-    gpio_set_level(MOTOR_A_IN2_GPIO, 0);
-    gpio_set_level(MOTOR_B_IN3_GPIO, 1);
-    gpio_set_level(MOTOR_B_IN4_GPIO, 0);
+    gpio_set_level(MOTOR_A_IN1, 0);
+    gpio_set_level(MOTOR_A_IN2, 1);
+    gpio_set_level(MOTOR_B_IN3, 1);
+    gpio_set_level(MOTOR_B_IN4, 0);
 }
-
 static void motor_right(void) {
-    gpio_set_level(MOTOR_A_IN1_GPIO, 1);
-    gpio_set_level(MOTOR_A_IN2_GPIO, 0);
-    gpio_set_level(MOTOR_B_IN3_GPIO, 0);
-    gpio_set_level(MOTOR_B_IN4_GPIO, 0);
+    gpio_set_level(MOTOR_A_IN1, 1);
+    gpio_set_level(MOTOR_A_IN2, 0);
+    gpio_set_level(MOTOR_B_IN3, 0);
+    gpio_set_level(MOTOR_B_IN4, 1);
+}
+static void motor_stop(void) {
+    gpio_set_level(MOTOR_A_IN1, 0);
+    gpio_set_level(MOTOR_A_IN2, 0);
+    gpio_set_level(MOTOR_B_IN3, 0);
+    gpio_set_level(MOTOR_B_IN4, 0);
 }
 
 
-//——— ULTRASONIC HELPERS ———
+//———————————————————————————————————————————————
+//— Ultrasonic measurement via esp_timer
+//———————————————————————————————————————————————
 
 // ——— Measure once, return distance in cm ———
-static float ultrasonic_read_cm(void) {
-    // 1) Fire a 10 µs pulse
-    gpio_set_level(ULTRASONIC_TRIG_PIN, 1);
+static void ultrasonic_timer_cb(void* arg) {
+    // send 10µs trigger
+    gpio_set_level(ULTRA_TRIG_PIN, 1);
     esp_rom_delay_us(10);
-    gpio_set_level(ULTRASONIC_TRIG_PIN, 0);
+    gpio_set_level(ULTRA_TRIG_PIN, 0);
 
-    // 2) Wait for echo to go high (with timeout)
-    int64_t start = esp_timer_get_time();
-    while (gpio_get_level(ULTRASONIC_ECHO_PIN) == 0) {
-        if (esp_timer_get_time() - start > 20000) {
-            // no echo within 20 ms → out of range
-            return -1.0f;
-        }
+    // wait for echo high
+    int64_t t0 = esp_timer_get_time();
+    while (gpio_get_level(ULTRA_ECHO_PIN) == 0 &&
+           esp_timer_get_time() - t0 < 20000) {}
+    if (gpio_get_level(ULTRA_ECHO_PIN) == 0) {
+        g_ultrasonic_cm = -1.0f;
+        return;
     }
 
-    // 3) Timestamp rising edge
+    // measure pulse width
     int64_t t1 = esp_timer_get_time();
-
-    // 4) Wait for echo to go low (with timeout)
-    while (gpio_get_level(ULTRASONIC_ECHO_PIN) == 1) {
-        if (esp_timer_get_time() - t1 > 20000) {
-            // stuck high → error
-            return -2.0f;
-        }
-    }
+    while (gpio_get_level(ULTRA_ECHO_PIN) == 1 &&
+           esp_timer_get_time() - t1 < 20000) {}
     int64_t t2 = esp_timer_get_time();
-
-    // 5) Compute distance
-    int64_t dt = t2 - t1;  // round-trip time in µs
-    float distance = (dt / 2.0f) * 0.0343f;
-    return distance;
+    float dt = (float)(t2 - t1);  // µs
+    g_ultrasonic_cm = (dt * 0.0343f) / 2.0f;
 }
 
 
-//——— Blink & random-servo demo ———
-
-static void blink_led(void) {
-    gpio_set_level(GPIO_NUM_13, s_led_state);
-}
-
-static void blink_task(void *arg) {
-    int angle1 = 90, angle2 = 90;
-    while (1) {
-        s_led_state = !s_led_state;
-        blink_led();
-
-        // random new angles
-        int na1 = esp_random() % 181;
-        int na2 = 70 + (esp_random() % 41);
-        move_servo_smooth(SERVO_PWM_CHANNEL_1, angle1, na1, 10);
-        move_servo_smooth(SERVO_PWM_CHANNEL_2, angle2, na2, 10);
-        angle1 = na1;  angle2 = na2;
-
-        vTaskDelay(pdMS_TO_TICKS(5000));
+//——— Expressive reaction on obstacle ————————————————————
+// quick LED+servo animation
+static void express_react(void) {
+    // LED flash x3
+    for (int i = 0; i < 3; i++) {
+        gpio_set_level(GPIO_NUM_13, 1);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        gpio_set_level(GPIO_NUM_13, 0);
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
+    // wave servo 2 out-and-back
+    for (int a = 90; a <= 150; a += 10) {
+        set_servo(SERVO_CHANNEL_2, a);
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    for (int a = 150; a >= 90; a -= 10) {
+        set_servo(SERVO_CHANNEL_2, a);
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    // restore center
+    set_servo(SERVO_CHANNEL_2, 90);
 }
 
 
 //——— TASKS ———
 
-// ——— Example task: print every 500 ms ———
-static void ultrasonic_task(void *arg) {
-    char buffer[32];  // Buffer for formatting the UART message
+//———————————————————————————————————————————————
+//— Random-mode task (priority 5)
+//———————————————————————————————————————————————
+
+static void random_task(void* arg) {
+    const float THRESHOLD = 20.0f;  // cm
     while (1) {
-        float d = ultrasonic_read_cm();
-        if (d < 0) {
-            snprintf(buffer, sizeof(buffer), "U:ERR:%.1f\r\n", d);
+        if (g_ultrasonic_cm > 0 && g_ultrasonic_cm < THRESHOLD) {
+            // obstacle → random turn
+            obstacle_count++;
+            express_react();
+            motor_stop();
+
+            int d = esp_random() % 4;
+            if      (d == 0) motor_left();
+            else if (d == 1) motor_right();
+            else if (d == 2) motor_reverse();
+            else             motor_forward();
+            vTaskDelay(pdMS_TO_TICKS(300));
+        }
+        // drive forward
+        motor_forward();
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+}
+
+//———————————————————————————————————————————————
+//— Voice-mode task (priority 4) NOT FINISHED
+//———————————————————————————————————————————————
+
+static void voice_task(void* arg) {
+    // suspend self until mode=VOICE
+    vTaskSuspend(NULL);
+    while (1) {
+        // TODO: integrate microphone ISR / DMA here
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+//——— Diagnostic task → LabVIEW (priority 3) —————————
+static void diagnostic_task(void* arg) {
+    char out[64];
+    while (1) {
+        if (g_ultrasonic_cm < 0) {
+            snprintf(out, sizeof(out), "OBSTCNT %u DIST ERR\r\n",
+                     obstacle_count);
         } else {
-            snprintf(buffer, sizeof(buffer), "U:%.1f\r\n", d);
+            snprintf(out, sizeof(out), "OBSTCNT %u DIST %.1f\r\n",
+                     obstacle_count, g_ultrasonic_cm);
         }
-        uart_write_bytes(ECHO_UART_PORT_NUM, buffer, strlen(buffer));
-        vTaskDelay(pdMS_TO_TICKS(500));
+        uart_write_bytes(UART_PORT_NUM, out, strlen(out));
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
-static void echo_task(void *arg) { // TODO: UPDATE TO PROPERLY SEND NEW COMMANDS W LABVIEW
-    // 1) Configure and install UART driver
-    uart_config_t uart_config = {
-        .baud_rate = ECHO_UART_BAUD_RATE,
-        .data_bits = UART_DATA_8_BITS,
-        .parity    = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_DEFAULT,
+//———————————————————————————————————————————————
+//— UART & mode manager (priority 10)
+//———————————————————————————————————————————————
+
+static void echo_task(void* arg) {
+    // 1) UART driver install
+    uart_config_t cfg = {
+        .baud_rate  = UART_BAUD_RATE,
+        .data_bits  = UART_DATA_8_BITS,
+        .parity     = UART_PARITY_DISABLE,
+        .stop_bits  = UART_STOP_BITS_1,
+        .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT
     };
-    ESP_ERROR_CHECK(uart_driver_install(ECHO_UART_PORT_NUM, BUF_SIZE * 2, 0, 0, NULL, 0));
-    ESP_ERROR_CHECK(uart_param_config(ECHO_UART_PORT_NUM, &uart_config));
-    ESP_ERROR_CHECK(uart_set_pin(ECHO_UART_PORT_NUM, ECHO_TEST_TXD, ECHO_TEST_RXD, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    ESP_ERROR_CHECK(uart_driver_install(UART_PORT_NUM, UART_BUF_SIZE*2, 0, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_param_config(UART_PORT_NUM, &cfg));
+    ESP_ERROR_CHECK(uart_set_pin(UART_PORT_NUM, UART_TX_PIN, UART_RX_PIN,
+                                UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
 
-    // 2) Allocate buffer for incoming data
-    uint8_t *data = malloc(BUF_SIZE);
-    if (!data) {
-        ESP_LOGE("echo_task", "Buffer allocation failed");
-        vTaskDelete(NULL);
-        return;
-    }
+    // 2) Handshake & buffer
+    uint8_t* buf = malloc(UART_BUF_SIZE);
+    uart_write_bytes(UART_PORT_NUM, "Commands\r\n", strlen("Commands\r\n"));
 
-    // 3) Send handshake so LabVIEW can detect connection
-    uart_write_bytes(ECHO_UART_PORT_NUM, "Commands", strlen("Commands"));
-
-    // 4) Main loop: read → interpret
     while (1) {
-        int len = uart_read_bytes(ECHO_UART_PORT_NUM, data, BUF_SIZE - 1, 20 / portTICK_PERIOD_MS);
-        if (len > 0) {
-            data[len] = '\0';  // null-terminate
+        int len = uart_read_bytes(UART_PORT_NUM, buf, UART_BUF_SIZE-1, pdMS_TO_TICKS(50));
+        if (len <= 0) continue;
+        buf[len] = '\0';
+        char cmd = buf[0];
 
-            switch (data[0]) {
-                case 'I':
-                    // Connection initialization: LED on + respond
-                    gpio_set_level(GPIO_NUM_13, 1);
-                    uart_write_bytes(ECHO_UART_PORT_NUM, "ESP32\r\n", strlen("ESP32\r\n"));
-                    break;
-                case 'A':
-                    // Turn LED13 ON
-                    gpio_set_level(GPIO_NUM_13, 1);
-                    uart_write_bytes(ECHO_UART_PORT_NUM, "LED ON\r\n", strlen("LED ON\r\n"));
-                    break;
-                case 'B':
-                    // Turn LED13 OFF
-                    gpio_set_level(GPIO_NUM_13, 0);
-                    uart_write_bytes(ECHO_UART_PORT_NUM, "LED OFF\r\n", strlen("LED OFF\r\n"));
-                    break;
+        switch (cmd) {
+            case 'I':
+                // connection init
+                gpio_set_level(GPIO_NUM_13, 1);
+                uart_write_bytes(UART_PORT_NUM, "ESP32\r\n", strlen("ESP32\r\n"));
+                break;
 
-                case 'R':
-                    //Start ultrasonic task?
-                    xTaskCreate(ultrasonic_task, "ultra", 2048, NULL, 5, NULL);
+            // — MODE SWITCHES —
+            case '1':  // RANDOM
+                current_mode = MODE_RANDOM;
+                vTaskResume(randomTaskHandle);
+                vTaskSuspend(voiceTaskHandle);
+                uart_write_bytes(UART_PORT_NUM, "MODE RANDOM\r\n", 13);
+                break;
+            case '2':  // REMOTE
+                current_mode = MODE_REMOTE;
+                vTaskSuspend(randomTaskHandle);
+                vTaskSuspend(voiceTaskHandle);
+                uart_write_bytes(UART_PORT_NUM, "MODE REMOTE\r\n", 13);
+                break;
+            case '3':  // VOICE
+                current_mode = MODE_VOICE;
+                vTaskSuspend(randomTaskHandle);
+                vTaskResume(voiceTaskHandle);
+                uart_write_bytes(UART_PORT_NUM, "MODE VOICE\r\n", 12);
+                break;
 
-                default:
-                    // ignore other commands
-                    break;
-            }
+            // — REMOTE-CONTROL COMMANDS —
+            case 'F': if (current_mode==MODE_REMOTE) motor_forward();  break;
+            case 'G': if (current_mode==MODE_REMOTE) motor_reverse();  break;
+            case 'L': if (current_mode==MODE_REMOTE) motor_left();     break;
+            case 'H': if (current_mode==MODE_REMOTE) motor_right();    break;
+            case 'S': if (current_mode==MODE_REMOTE) motor_stop();     break;
+
+            // — ON-DEMAND DISTANCE —
+            case 'U': {
+                char out[32];
+                if (g_ultrasonic_cm < 0) {
+                    snprintf(out, sizeof(out), "DIST ERR\r\n");
+                } else {
+                    snprintf(out, sizeof(out), "DIST %.1f\r\n", g_ultrasonic_cm);
+                }
+                uart_write_bytes(UART_PORT_NUM, out, strlen(out));
+            } break;
+
+            default:
+                break;
         }
     }
 }
-
 
 void app_main(void) {
-
-    // 1) Init all hardware
+    // 1) Hardware init
     init_led();
     init_servo();
     init_motor();
-    ultrasonic_init();
+    init_ultrasonic();
 
-    // Launch the UART echo / command task
-    xTaskCreate(echo_task, "uart_echo_task", ECHO_TASK_STACK_SIZE, NULL, 10, NULL);
+    // 2) Start periodic ultrasonic timer (500 ms)
+    const esp_timer_create_args_t targs = {
+        .callback = ultrasonic_timer_cb,
+        .name     = "ultra_timer"
+    };
+    esp_timer_handle_t tm;
+    esp_timer_create(&targs, &tm);
+    esp_timer_start_periodic(tm, 500000);
 
-    // 3) Launch the ultrasonic measurement task
-    // xTaskCreate(ultrasonic_task, "ultra", 2048, NULL, 5, NULL);
+    // 3) Create mode tasks
+    xTaskCreate(random_task, "MODE_RANDOM", 2048, NULL, 5, &randomTaskHandle);
+    xTaskCreate(voice_task,  "MODE_VOICE",  2048, NULL, 4, &voiceTaskHandle);
+    xTaskCreate(diagnostic_task, "DIAG", 2048, NULL,  3, NULL);
+    vTaskSuspend(randomTaskHandle);
+    vTaskSuspend(voiceTaskHandle);
+
+    // 4) UART & mode‐manager
+    xTaskCreate(echo_task,   "MODE_UART",   UART_TASK_STACK, NULL, 10, NULL);
 }
