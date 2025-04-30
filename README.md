@@ -1,76 +1,96 @@
-| Supported Targets | ESP32 | ESP32-C2 | ESP32-C3 | ESP32-C5 | ESP32-C6 | ESP32-C61 | ESP32-H2 | ESP32-P4 | ESP32-S2 | ESP32-S3 |
-| ----------------- | ----- | -------- | -------- | -------- | -------- | --------- | -------- | -------- | -------- | -------- |
+# MO (From WALL-E)
 
-# UART Echo Example
+A FreeRTOS-based firmware for an ESP32 Feather V2 that supports three operation modes (Random, Remote, Voice), real-time ultrasonic sensing, servo/motor control, and a diagnostic stream for LabVIEW.
 
-(See the README.md file in the upper level 'examples' directory for more information about examples.)
+---
 
-This example demonstrates how to utilize UART interfaces by echoing back to the sender any data received on
-configured UART.
+## 1. Hardware & Wiring
 
-## How to use example
+- **Ultrasonic Sensor (HC-SR04–compatible)**
+  - **VCC** → 3V3
+  - **GND** → GND
+  - **TRIG** → GPIO4
+  - **ECHO** → GPIO15
+- **Servos**
+  - Servo 1 → GPIO12 (LEDC channel 0)
+  - Servo 2 → GPIO13 (LEDC channel 1)
+- **Motors (H-bridge inputs)**
+  - A_IN1 → GPIO7
+  - A_IN2 → GPIO8
+  - B_IN3 → GPIO26
+  - B_IN4 → GPIO25
+- **Heartbeat / Expression LED** → GPIO13 (shared with Servo 2 signal, used as status LED)
 
-### Hardware Required
+---
 
-The example can be run on any development board, that is based on the Espressif SoC. The board shall be connected to a computer with a single USB cable for flashing and monitoring. The external interface should have 3.3V outputs. You may
-use e.g. 3.3V compatible USB-to-Serial dongle.
+## 2. Build & Flash
 
-### Setup the Hardware
+1. Open in VS Code with the ESP-IDF extension.  
+2. Set SERIAL PORT to the port of the ESP32 Feather V2.  
+3. **Build** & **Flash**
+4. Open **MO SERIAL.vi** in LabView, **Run** the VI, and press **RESET** on the ESP32.
 
-Connect the external serial interface to the board as follows.
+---
 
-```
-  -----------------------------------------------------------------------------------------
-  | Target chip Interface | Kconfig Option     | Default ESP Pin      | External UART Pin |
-  | ----------------------|--------------------|----------------------|--------------------
-  | Transmit Data (TxD)   | EXAMPLE_UART_TXD   | GPIO4                | RxD               |
-  | Receive Data (RxD)    | EXAMPLE_UART_RXD   | GPIO5                | TxD               |
-  | Ground                | n/a                | GND                  | GND               |
-  -----------------------------------------------------------------------------------------
-```
-Note: Some GPIOs can not be used with certain chips because they are reserved for internal use. Please refer to UART documentation for selected target.
+## 3. LabVIEW Command Map
 
-Optionally, you can set-up and use a serial interface that has RTS and CTS signals in order to verify that the
-hardware control flow works. Connect the extra signals according to the following table, configure both extra pins in
-the example code `uart_echo_example_main.c` by replacing existing `UART_PIN_NO_CHANGE` macros with the appropriate pin
-numbers and configure UART1 driver to use the hardware flow control by setting `.flow_ctrl = UART_HW_FLOWCTRL_CTS_RTS`
-and adding `.rx_flow_ctrl_thresh = 122` to the `uart_config` structure.
+| Command | Action                                                       |
+|:-------:|:-------------------------------------------------------------|
+| `I`     | **Handshake**: LED13 ON, replies `"ESP32\r\n"`               |
+| `1`     | **Mode → Random**: obstacle-avoidance task runs               |
+| `2`     | **Mode → Remote**: manual motor/servo commands enable         |
+| `3`     | **Mode → Voice**: (placeholder) voice task runs               |
+| `F`     | **Forward** (Remote mode only)                                |
+| `G`     | **Reverse** (Remote mode only)                                |
+| `L`     | **Turn Left** (Remote mode only)                              |
+| `H`     | **Turn Right** (Remote mode only)                             |
+| `S`     | **Stop Motors** (Remote mode only)                            |
+| `U`     | **On-demand Ultrasonic**: replies `"DIST xx.x\r\n"`           |
+| (Periodic) | **Diagnostics** (every 1 s): `"OBSTCNT <n> DIST <x.x>\r\n"` |
 
-```
-  ---------------------------------------------------------------
-  | Target chip Interface | Macro           | External UART Pin |
-  | ----------------------|-----------------|--------------------
-  | Transmit Data (TxD)   | ECHO_TEST_RTS   | CTS               |
-  | Receive Data (RxD)    | ECHO_TEST_CTS   | RTS               |
-  | Ground                | n/a             | GND               |
-  ---------------------------------------------------------------
-```
+---
 
-### Configure the project
+## 4. FreeRTOS Tasks & Priorities
 
-Use the command below to configure project using Kconfig menu as showed in the table above.
-The default Kconfig values can be changed such as: EXAMPLE_TASK_STACK_SIZE, EXAMPLE_UART_BAUD_RATE, EXAMPLE_UART_PORT_NUM (Refer to Kconfig file).
-```
-idf.py menuconfig
-```
+| Task                | Priority | Purpose                                                                                  |
+|:-------------------:|:--------:|:-----------------------------------------------------------------------------------------|
+| **echo_task**       | **10**   | UART manager & mode switch; interprets LabVIEW commands, suspends/resumes tasks         |
+| **random_task**     | **5**    | Automatic navigation: drives forward, checks distance, reacts and turns on obstacle      |
+| **voice_task**      | **4**    | Placeholder for future voice-control logic (starts suspended until Mode 3)               |
+| **diagnostic_task** | **3**    | Sends obstacle count & latest distance over UART every second                           |
+| **Timer ISR**       | n/a      | Hardware timer callback every 500 ms → updates `g_ultrasonic_cm` (preempts all tasks)   |
 
-### Build and Flash
+- **`TaskHandle_t`**  
+  - Captures a reference when you need to suspend/resume/delete a task.  
+  - E.g. `randomTaskHandle` is used by `echo_task` to start/stop random navigation.  
+  - We pass `NULL` for `diagnostic_task` since it runs continuously and never needs to be paused.
 
-Build the project and flash it to the board, then run monitor tool to view serial output:
+---
 
-```
-idf.py -p PORT flash monitor
-```
+## 5. Ultrasonic & Interrupts
 
-(To exit the serial monitor, type ``Ctrl-]``.)
+- An **ESP-Timer** is configured in `app_main()` to fire **every 500 ms**.  
+- Its callback (`ultrasonic_timer_cb`) runs in **ISR context**, pulsing the TRIG pin, measuring ECHO timing, and storing the result in `g_ultrasonic_cm`.  
+- Because ISRs preempt all tasks, the distance is updated without blocking any FreeRTOS task.
 
-See the Getting Started Guide for full steps to configure and use ESP-IDF to build projects.
+---
 
-## Example Output
+## 6. Obstacle Reaction & Diagnostics
 
-Type some characters in the terminal connected to the external serial interface. As result you should see echo in the same terminal which you used for typing the characters. You can verify if the echo indeed comes from ESP board by
-disconnecting either `TxD` or `RxD` pin: no characters will appear when typing.
+- **`random_task`** monitors `g_ultrasonic_cm`.  
+  - If distance < 20 cm, increments `obstacle_count`, calls `express_react()` (LED flashes + servo wave), then picks a random turn.  
+- **`diagnostic_task`** wakes every 1 s and emits:
+  - OBSTCNT <obstacle_count> DIST <g_ultrasonic_cm>
+  over UART for LabVIEW to parse and display.
 
-## Troubleshooting
+---
 
-You are not supposed to see the echo in the terminal which is used for flashing and monitoring, but in the other UART configured through Kconfig can be used.
+## 7. Multitasking & Scheduling Logic
+
+1. **UART manager** (prio 10) always preempts other tasks to handle commands in real time.  
+2. **Random navigation** (prio 5) preempts diagnostics but yields during delays.  
+3. **Voice placeholder** (prio 4) suspended until Mode 3 selected.  
+4. **Diagnostics** (prio 3) runs only when higher-priority tasks are blocked/yielding.  
+5. **Timer ISR** (hardware level) fires every 500 ms to update the ultrasonic reading, potentially unblocking the random task immediately if in obstacle threshold.
+
+_FreeRTOS_ ensures that the highest-priority ready task runs at all times, while timer interrupts and GPIO ISRs can wake or notify tasks to guarantee responsive, real-time behavior.
