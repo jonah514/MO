@@ -98,15 +98,24 @@ static void init_servo(void) {
 }
 
 static void init_motor(void) {
+    // Reset pins and set as outputs
+    gpio_reset_pin(MOTOR_A_IN1);
+    gpio_reset_pin(MOTOR_A_IN2);
+    gpio_reset_pin(MOTOR_B_IN3);
+    gpio_reset_pin(MOTOR_B_IN4);
+    
     gpio_set_direction(MOTOR_A_IN1, GPIO_MODE_OUTPUT);
     gpio_set_direction(MOTOR_A_IN2, GPIO_MODE_OUTPUT);
     gpio_set_direction(MOTOR_B_IN3, GPIO_MODE_OUTPUT);
     gpio_set_direction(MOTOR_B_IN4, GPIO_MODE_OUTPUT);
+    
     // ensure stopped
     gpio_set_level(MOTOR_A_IN1, 0);
     gpio_set_level(MOTOR_A_IN2, 0);
     gpio_set_level(MOTOR_B_IN3, 0);
     gpio_set_level(MOTOR_B_IN4, 0);
+    
+    printf("Motor pins initialized with enables HIGH\r\n");
 }
 
 static void init_ultrasonic(void) {
@@ -141,32 +150,49 @@ static void set_servo(int channel, int angle) {
 static void motor_forward(void) {
     gpio_set_level(MOTOR_A_IN1, 1);
     gpio_set_level(MOTOR_A_IN2, 0);
+    // Single motor test - Motor B disabled
+    /*
     gpio_set_level(MOTOR_B_IN3, 1);
     gpio_set_level(MOTOR_B_IN4, 0);
+    */
 }
 static void motor_reverse(void) {
     gpio_set_level(MOTOR_A_IN1, 0);
     gpio_set_level(MOTOR_A_IN2, 1);
+    // Single motor test - Motor B disabled
+    /*
     gpio_set_level(MOTOR_B_IN3, 0);
     gpio_set_level(MOTOR_B_IN4, 1);
+    */
 }
 static void motor_left(void) {
+    // For single motor test - just reverse Motor A
     gpio_set_level(MOTOR_A_IN1, 0);
     gpio_set_level(MOTOR_A_IN2, 1);
+    // Single motor test - Motor B disabled
+    /*
     gpio_set_level(MOTOR_B_IN3, 1);
     gpio_set_level(MOTOR_B_IN4, 0);
+    */
 }
 static void motor_right(void) {
+    // For single motor test - just forward Motor A
     gpio_set_level(MOTOR_A_IN1, 1);
     gpio_set_level(MOTOR_A_IN2, 0);
+    // Single motor test - Motor B disabled
+    /*
     gpio_set_level(MOTOR_B_IN3, 0);
     gpio_set_level(MOTOR_B_IN4, 1);
+    */
 }
 static void motor_stop(void) {
     gpio_set_level(MOTOR_A_IN1, 0);
     gpio_set_level(MOTOR_A_IN2, 0);
+    // Single motor test - Motor B disabled
+    /*
     gpio_set_level(MOTOR_B_IN3, 0);
     gpio_set_level(MOTOR_B_IN4, 0);
+    */
 }
 
 
@@ -231,22 +257,32 @@ static void express_react(void) {
 //———————————————————————————————————————————————
 
 static void random_task(void* arg) {
-    const float THRESHOLD = 20.0f;  // cm
+    const float THRESHOLD = 10.0f;  // cm
     while (1) {
         if (g_ultrasonic_cm > 0 && g_ultrasonic_cm < THRESHOLD) {
-            // obstacle → random turn
+            // obstacle encountered
             obstacle_count++;
             express_react();
+            
+            // 1. Stop and back up slightly
             motor_stop();
-
-            int d = esp_random() % 4;
-            if      (d == 0) motor_left();
-            else if (d == 1) motor_right();
-            else if (d == 2) motor_reverse();
-            else             motor_forward();
-            vTaskDelay(pdMS_TO_TICKS(300));
+            motor_reverse();
+            vTaskDelay(pdMS_TO_TICKS(300));  // back up for 300ms
+            motor_stop();
+            
+            // 2. Random turn (left or right) for random duration
+            if (esp_random() % 2 == 0) {
+                motor_left();
+            } else {
+                motor_right();
+            }
+            // Random turn duration between 100ms and 1000ms
+            // This will create turns ranging from small to large angles
+            int turn_duration = (esp_random() % 901) + 100;  // 100 to 1000ms
+            vTaskDelay(pdMS_TO_TICKS(turn_duration));
+            motor_stop();
         }
-        // drive forward
+        // Continue forward
         motor_forward();
         vTaskDelay(pdMS_TO_TICKS(200));
     }
@@ -270,10 +306,10 @@ static void diagnostic_task(void* arg) {
     char out[64];
     while (1) {
         if (g_ultrasonic_cm < 0) {
-            snprintf(out, sizeof(out), "OBSTCNT %u DIST ERR\r\n",
+            snprintf(out, sizeof(out), "OBSTCNT %lu DIST ERR\r\n",
                      obstacle_count);
         } else {
-            snprintf(out, sizeof(out), "OBSTCNT %u DIST %.1f\r\n",
+            snprintf(out, sizeof(out), "OBSTCNT %lu DIST %.1f\r\n",
                      obstacle_count, g_ultrasonic_cm);
         }
         uart_write_bytes(UART_PORT_NUM, out, strlen(out));
@@ -309,7 +345,12 @@ static void echo_task(void* arg) {
         if (len <= 0) continue;
         buf[len] = '\0';
         char cmd = buf[0];
-
+        
+        // Echo received command to serial output
+        char echo_msg[64];
+        snprintf(echo_msg, sizeof(echo_msg), "Received command: %c\r\n", cmd);
+        printf("%s", echo_msg);
+        
         switch (cmd) {
             case 'I':
                 // connection init
@@ -367,6 +408,9 @@ void app_main(void) {
     init_servo();
     init_motor();
     init_ultrasonic();
+    
+    // Explicitly ensure motors are stopped after initialization
+    motor_stop();
 
     // 2) Start periodic ultrasonic timer (500 ms)
     const esp_timer_create_args_t targs = {
@@ -379,10 +423,14 @@ void app_main(void) {
 
     // 3) Create mode tasks
     xTaskCreate(random_task, "MODE_RANDOM", 2048, NULL, 5, &randomTaskHandle);
+    vTaskSuspend(randomTaskHandle);  // Ensure random task is suspended initially
+    motor_stop();
+
     xTaskCreate(voice_task,  "MODE_VOICE",  2048, NULL, 4, &voiceTaskHandle);
+    vTaskSuspend(voiceTaskHandle);  // Ensure voice task is suspended initially
+
+
     xTaskCreate(diagnostic_task, "DIAG", 2048, NULL,  3, NULL);
-    vTaskSuspend(randomTaskHandle);
-    vTaskSuspend(voiceTaskHandle);
 
     // 4) UART & mode‐manager
     xTaskCreate(echo_task,   "MODE_UART",   UART_TASK_STACK, NULL, 10, NULL);
