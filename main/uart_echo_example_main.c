@@ -22,8 +22,8 @@
 #define UART_TASK_STACK     (CONFIG_EXAMPLE_TASK_STACK_SIZE)
 
 //— pins & PWM for servo ————————————————————————————
-#define SERVO_GPIO1         GPIO_NUM_12
-#define SERVO_GPIO2         GPIO_NUM_13
+#define SERVO_GPIO1         GPIO_NUM_12 //tilt
+#define SERVO_GPIO2         GPIO_NUM_13 //pan
 #define SERVO_FREQ_HZ       50
 #define SERVO_TIMER         LEDC_TIMER_0
 #define SERVO_CHANNEL_1     LEDC_CHANNEL_0
@@ -61,6 +61,19 @@ static volatile uint32_t obstacle_count = 0;
 static TaskHandle_t randomTaskHandle = NULL;
 static TaskHandle_t voiceTaskHandle  = NULL;
 
+//——— SERVO HELPERS ———
+
+static uint32_t angle_to_duty(int angle) {
+    return SERVO_MIN_US +
+         ((SERVO_MAX_US - SERVO_MIN_US) * angle) / SERVO_MAX_DEG;
+}
+
+static void set_servo(int channel, int angle) {
+    uint32_t us = angle_to_duty(angle);
+    uint32_t duty = (us * (1 << 13)) / (1000000 / SERVO_FREQ_HZ);
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, channel, duty);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, channel);
+}
 
 //———————————————————————————————————————————————
 //— Initialization routines
@@ -95,6 +108,12 @@ static void init_servo(void) {
         };
         ledc_channel_config(&c);
     }
+
+    // Initialize both servos to center position (90 degrees)
+    set_servo(SERVO_CHANNEL_1, 90);  // Center tilt
+    set_servo(SERVO_CHANNEL_2, 90);  // Center pan
+    
+    printf("Servos initialized to center position\r\n");
 }
 
 static void init_motor(void) {
@@ -128,21 +147,6 @@ static void init_ultrasonic(void) {
 }
 
 
-//——— SERVO HELPERS ———
-
-static uint32_t angle_to_duty(int angle) {
-    return SERVO_MIN_US +
-         ((SERVO_MAX_US - SERVO_MIN_US) * angle) / SERVO_MAX_DEG;
-}
-
-static void set_servo(int channel, int angle) {
-    uint32_t us = angle_to_duty(angle);
-    uint32_t duty = (us * (1 << 13)) / (1000000 / SERVO_FREQ_HZ);
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, channel, duty);
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, channel);
-}
-
-
 //———————————————————————————————————————————————
 //— Motor primitives
 //———————————————————————————————————————————————
@@ -150,49 +154,32 @@ static void set_servo(int channel, int angle) {
 static void motor_forward(void) {
     gpio_set_level(MOTOR_A_IN1, 1);
     gpio_set_level(MOTOR_A_IN2, 0);
-    // Single motor test - Motor B disabled
-    /*
     gpio_set_level(MOTOR_B_IN3, 1);
     gpio_set_level(MOTOR_B_IN4, 0);
-    */
 }
 static void motor_reverse(void) {
     gpio_set_level(MOTOR_A_IN1, 0);
     gpio_set_level(MOTOR_A_IN2, 1);
-    // Single motor test - Motor B disabled
-    /*
     gpio_set_level(MOTOR_B_IN3, 0);
     gpio_set_level(MOTOR_B_IN4, 1);
-    */
 }
 static void motor_left(void) {
-    // For single motor test - just reverse Motor A
     gpio_set_level(MOTOR_A_IN1, 0);
     gpio_set_level(MOTOR_A_IN2, 1);
-    // Single motor test - Motor B disabled
-    /*
     gpio_set_level(MOTOR_B_IN3, 1);
     gpio_set_level(MOTOR_B_IN4, 0);
-    */
 }
 static void motor_right(void) {
-    // For single motor test - just forward Motor A
     gpio_set_level(MOTOR_A_IN1, 1);
     gpio_set_level(MOTOR_A_IN2, 0);
-    // Single motor test - Motor B disabled
-    /*
     gpio_set_level(MOTOR_B_IN3, 0);
     gpio_set_level(MOTOR_B_IN4, 1);
-    */
 }
 static void motor_stop(void) {
     gpio_set_level(MOTOR_A_IN1, 0);
     gpio_set_level(MOTOR_A_IN2, 0);
-    // Single motor test - Motor B disabled
-    /*
     gpio_set_level(MOTOR_B_IN3, 0);
     gpio_set_level(MOTOR_B_IN4, 0);
-    */
 }
 
 
@@ -245,6 +232,15 @@ static void express_react(void) {
         set_servo(SERVO_CHANNEL_2, a);
         vTaskDelay(pdMS_TO_TICKS(50));
     }
+        // wave servo 2 out-and-back
+    for (int a = 90; a <= 150; a += 10) {
+        set_servo(SERVO_CHANNEL_1, a);
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    for (int a = 150; a >= 90; a -= 10) {
+        set_servo(SERVO_CHANNEL_1, a);
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
     // restore center
     set_servo(SERVO_CHANNEL_2, 90);
 }
@@ -262,13 +258,14 @@ static void random_task(void* arg) {
         if (g_ultrasonic_cm > 0 && g_ultrasonic_cm < THRESHOLD) {
             // obstacle encountered
             obstacle_count++;
-            express_react();
             
             // 1. Stop and back up slightly
             motor_stop();
+            vTaskDelay(pdMS_TO_TICKS(500));
             motor_reverse();
             vTaskDelay(pdMS_TO_TICKS(300));  // back up for 300ms
             motor_stop();
+            vTaskDelay(pdMS_TO_TICKS(200));  // Brief pause before turning
             
             // 2. Random turn (left or right) for random duration
             if (esp_random() % 2 == 0) {
@@ -276,12 +273,17 @@ static void random_task(void* arg) {
             } else {
                 motor_right();
             }
-            // Random turn duration between 100ms and 1000ms
-            // This will create turns ranging from small to large angles
-            int turn_duration = (esp_random() % 901) + 100;  // 100 to 1000ms
+            // Random turn duration between 500ms and 1500ms
+            // Increased duration for more noticeable turns
+            int turn_duration = (esp_random() % 1001) + 500;  // 500 to 1500ms
             vTaskDelay(pdMS_TO_TICKS(turn_duration));
             motor_stop();
+            vTaskDelay(pdMS_TO_TICKS(200));  // Brief pause after turning
+
+            // 3. Express reaction after completing the turn
+            express_react();
         }
+        
         // Continue forward
         motor_forward();
         vTaskDelay(pdMS_TO_TICKS(200));
@@ -412,14 +414,14 @@ void app_main(void) {
     // Explicitly ensure motors are stopped after initialization
     motor_stop();
 
-    // 2) Start periodic ultrasonic timer (500 ms)
+    // 2) Start periodic ultrasonic timer (200 ms)
     const esp_timer_create_args_t targs = {
         .callback = ultrasonic_timer_cb,
         .name     = "ultra_timer"
     };
     esp_timer_handle_t tm;
     esp_timer_create(&targs, &tm);
-    esp_timer_start_periodic(tm, 500000);
+    esp_timer_start_periodic(tm, 200000);
 
     // 3) Create mode tasks
     xTaskCreate(random_task, "MODE_RANDOM", 2048, NULL, 5, &randomTaskHandle);
