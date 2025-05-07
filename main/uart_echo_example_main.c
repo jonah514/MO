@@ -14,6 +14,7 @@
 #include "sdkconfig.h"
 #include "driver/adc.h"
 #include <math.h>
+#include "lcd_1602.h" // We'll create this header file
 
 // UART CONFIG, DONT CHANGE
 #define UART_TX_PIN         (CONFIG_EXAMPLE_UART_TXD)
@@ -24,9 +25,9 @@
 #define UART_TASK_STACK     (CONFIG_EXAMPLE_TASK_STACK_SIZE)
 
 //— pins & PWM for servo ————————————————————————————
-#define SERVO_GPIO1         GPIO_NUM_12 //tilt
-#define SERVO_GPIO2         GPIO_NUM_13 //pan
-#define SERVO_GPIO3         GPIO_NUM_14  //arm
+#define SERVO_GPIO1         GPIO_NUM_4 //tilt
+#define SERVO_GPIO2         GPIO_NUM_5 //pan
+#define SERVO_GPIO3         GPIO_NUM_13  //arm
 #define SERVO_FREQ_HZ       50
 #define SERVO_TIMER         LEDC_TIMER_0
 #define SERVO_CHANNEL_1     LEDC_CHANNEL_0
@@ -45,13 +46,21 @@
 #define MOTOR_B_IN4         GPIO_NUM_25
 
 //— ultrasonic pins ————————————————————————————————
-#define ULTRA_TRIG_PIN      GPIO_NUM_4
-#define ULTRA_ECHO_PIN      GPIO_NUM_15
+#define ULTRA_TRIG_PIN      GPIO_NUM_21
+#define ULTRA_ECHO_PIN      GPIO_NUM_36
 
 //— microphone pin ————————————————————————————————
 #define MIC_PIN             GPIO_NUM_34
 #define MIC_THRESHOLD       2000    // ADC raw value threshold (adjust after testing)
 #define MIC_CHECK_DELAY_MS  50      // How often to check microphone
+
+// LCD pin definitions
+#define LCD_RS_PIN      GPIO_NUM_14
+#define LCD_E_PIN       GPIO_NUM_32
+#define LCD_D4_PIN      GPIO_NUM_15
+#define LCD_D5_PIN      GPIO_NUM_33
+#define LCD_D6_PIN      GPIO_NUM_27
+#define LCD_D7_PIN      GPIO_NUM_12
 
 //— modes ————————————————————————————————————————
 typedef enum {
@@ -73,6 +82,222 @@ static TaskHandle_t voiceTaskHandle  = NULL;
 
 // Add a global variable to track the current arm position
 static int current_arm_position = SERVO_ARM_REST;
+
+// Define custom characters for square eyes
+const uint8_t FULL_BLOCK[8] = {
+    0b11111,
+    0b11111,
+    0b11111,
+    0b11111,
+    0b11111,
+    0b11111,
+    0b11111,
+    0b11111
+};
+
+// For blinking, we'll use a completely empty character
+const uint8_t EMPTY_BLOCK[8] = {
+    0b00000,
+    0b00000,
+    0b00000,
+    0b00000,
+    0b00000,
+    0b00000,
+    0b00000,
+    0b00000
+};
+
+// Middle line for half-closed eyes
+const uint8_t MIDDLE_LINE[8] = {
+    0b00000,
+    0b00000,
+    0b00000,
+    0b11111,
+    0b11111,
+    0b00000,
+    0b00000,
+    0b00000
+};
+
+// Increase task stack sizes to prevent stack overflow
+#define STANDARD_TASK_STACK_SIZE 4096  // Increased from default 2048
+
+// Function to display normal square eyes (5x2 blocks per eye, centered)
+static void display_normal_eyes(void) {
+    lcd_clear();
+    vTaskDelay(pdMS_TO_TICKS(20));
+    
+    // First row - both eyes
+    // We have 16 columns total, with 5 blocks per eye = 10 blocks
+    // That leaves 6 spaces to distribute: 1 at start, 4 between eyes, 1 at end
+    
+    // Left eye (first row)
+    lcd_set_cursor(1, 0);
+    for (int i = 0; i < 5; i++) {
+        lcd_write_char(0);  // Full block
+    }
+    
+    // Space between eyes
+    lcd_write_char(' ');
+    lcd_write_char(' ');
+    lcd_write_char(' ');
+    lcd_write_char(' ');
+    
+    // Right eye (first row)
+    for (int i = 0; i < 5; i++) {
+        lcd_write_char(0);  // Full block
+    }
+    
+    // Second row - both eyes
+    // Left eye (second row)
+    lcd_set_cursor(1, 1);
+    for (int i = 0; i < 5; i++) {
+        lcd_write_char(0);  // Full block
+    }
+    
+    // Space between eyes
+    lcd_write_char(' ');
+    lcd_write_char(' ');
+    lcd_write_char(' ');
+    lcd_write_char(' ');
+    
+    // Right eye (second row)
+    for (int i = 0; i < 5; i++) {
+        lcd_write_char(0);  // Full block
+    }
+}
+
+// Function to display half-closed eyes (blinking transition)
+static void display_half_closed_eyes(void) {
+    lcd_clear();
+    vTaskDelay(pdMS_TO_TICKS(20));
+    
+    // First row - both eyes
+    // Left eye (first row)
+    lcd_set_cursor(1, 0);
+    for (int i = 0; i < 5; i++) {
+        lcd_write_char(0);  // Full block
+    }
+    
+    // Space between eyes
+    lcd_write_char(' ');
+    lcd_write_char(' ');
+    lcd_write_char(' ');
+    lcd_write_char(' ');
+    
+    // Right eye (first row)
+    for (int i = 0; i < 5; i++) {
+        lcd_write_char(0);  // Full block
+    }
+    
+    // Second row - both eyes with middle line
+    // Left eye (second row)
+    lcd_set_cursor(1, 1);
+    for (int i = 0; i < 5; i++) {
+        lcd_write_char(2);  // Middle line
+    }
+    
+    // Space between eyes
+    lcd_write_char(' ');
+    lcd_write_char(' ');
+    lcd_write_char(' ');
+    lcd_write_char(' ');
+    
+    // Right eye (second row)
+    for (int i = 0; i < 5; i++) {
+        lcd_write_char(2);  // Middle line
+    }
+}
+
+// Function to display closed eyes (fully blinked)
+static void display_closed_eyes(void) {
+    lcd_clear();
+    vTaskDelay(pdMS_TO_TICKS(20));
+    
+    // First row - both eyes
+    // Left eye (first row)
+    lcd_set_cursor(1, 0);
+    for (int i = 0; i < 5; i++) {
+        lcd_write_char(1);  // Empty block
+    }
+    
+    // Space between eyes
+    lcd_write_char(' ');
+    lcd_write_char(' ');
+    lcd_write_char(' ');
+    lcd_write_char(' ');
+    
+    // Right eye (first row)
+    for (int i = 0; i < 5; i++) {
+        lcd_write_char(1);  // Empty block
+    }
+    
+    // Second row - both eyes
+    // Left eye (second row)
+    lcd_set_cursor(1, 1);
+    for (int i = 0; i < 5; i++) {
+        lcd_write_char(2);  // Middle line
+    }
+    
+    // Space between eyes
+    lcd_write_char(' ');
+    lcd_write_char(' ');
+    lcd_write_char(' ');
+    lcd_write_char(' ');
+    
+    // Right eye (second row)
+    for (int i = 0; i < 5; i++) {
+        lcd_write_char(2);  // Middle line
+    }
+}
+
+// Function to perform a natural blink animation
+static void blink_eyes(void) {
+    // Half-closed eyes
+    display_half_closed_eyes();
+    vTaskDelay(pdMS_TO_TICKS(50));
+    
+    // Fully closed eyes
+    display_closed_eyes();
+    vTaskDelay(pdMS_TO_TICKS(100));
+    
+    // Half-closed eyes again
+    display_half_closed_eyes();
+    vTaskDelay(pdMS_TO_TICKS(50));
+    
+    // Back to normal
+    display_normal_eyes();
+}
+
+static void display_angry_eyes(void) {
+    display_normal_eyes();
+}
+
+// Function to initialize the LCD
+static void init_lcd(void) {
+    // Add a delay before initialization to ensure power is stable
+    vTaskDelay(pdMS_TO_TICKS(200));
+    
+    // Initialize LCD in 4-bit mode
+    lcd_init(LCD_RS_PIN, LCD_E_PIN, LCD_D4_PIN, LCD_D5_PIN, LCD_D6_PIN, LCD_D7_PIN);
+    
+    // Add a longer delay after initialization
+    vTaskDelay(pdMS_TO_TICKS(300));
+    
+    // Create custom characters with longer delays between operations
+    lcd_create_char(0, FULL_BLOCK);   // Full block for normal eyes
+    vTaskDelay(pdMS_TO_TICKS(50));
+    lcd_create_char(1, EMPTY_BLOCK);  // Empty block for closed eyes
+    vTaskDelay(pdMS_TO_TICKS(50));
+    lcd_create_char(2, MIDDLE_LINE);  // Middle line for half-closed eyes
+    vTaskDelay(pdMS_TO_TICKS(50));
+    
+    // Clear display and home cursor
+    lcd_clear();
+    vTaskDelay(pdMS_TO_TICKS(50));
+    
+    printf("LCD initialization complete\n");
+}
 
 //——— SERVO HELPERS ———
 
@@ -241,6 +466,9 @@ static void express_react(void) {
     // Store original arm position to restore later
     int original_arm_pos = current_arm_position;
     
+    // Show surprised eyes
+    display_normal_eyes();
+    
     // Raise arm by 35 degrees (subtract since servo orientation)
     int raised_arm_pos = original_arm_pos - 35;
     if (raised_arm_pos < 0) raised_arm_pos = 0;  // Ensure we don't go below 0
@@ -253,6 +481,10 @@ static void express_react(void) {
         gpio_set_level(GPIO_NUM_13, 0);
         vTaskDelay(pdMS_TO_TICKS(100));
     }
+    
+    // Blink eyes
+    blink_eyes();
+    
     // wave servo 2 out-and-back (pan)
     for (int a = 90; a <= 150; a += 10) {
         set_servo(SERVO_CHANNEL_2, a);
@@ -278,6 +510,9 @@ static void express_react(void) {
 
 //——— Anger reaction - spin in circles and move servos ————————————————————
 static void express_anger(void) {
+    // Show angry eyes
+    display_angry_eyes();
+    
     // Store original servo positions to restore later
     int original_arm_pos = current_arm_position;
     
@@ -333,6 +568,9 @@ static void express_anger(void) {
     
     // Turn off LED
     gpio_set_level(GPIO_NUM_13, 0);
+    
+    // Return to normal eyes
+    display_normal_eyes();
 }
 
 //——— TASKS ———
@@ -413,7 +651,7 @@ static void microphone_task(void* arg) {
     int sample_index = 0;
     int sum = 0;
     float baseline = 0;
-    const int CALIBRATION_SAMPLES = 100;  // Number of samples to establish baseline
+    const int CALIBRATION_SAMPLES = 50;  // Reduced from 100 to avoid long blocking
     const float SOUND_THRESHOLD = 200.0f;  // Deviation threshold for sound detection
     bool in_cooldown = false;  // Flag to prevent multiple triggers
     int startup_delay = 20;    // Ignore first few readings to let mic stabilize
@@ -423,15 +661,28 @@ static void microphone_task(void* arg) {
         samples[i] = 0;
     }
     
-    // Establish baseline once at startup
+    // Establish baseline once at startup - with error handling
     printf("Calibrating baseline - please keep quiet...\n");
     int baseline_sum = 0;
+    int valid_samples = 0;
+    
     for (int i = 0; i < CALIBRATION_SAMPLES; i++) {
-        baseline_sum += adc1_get_raw(ADC1_CHANNEL_6);
+        int raw_value = adc1_get_raw(ADC1_CHANNEL_6);
+        if (raw_value >= 0) {  // Check for valid reading
+            baseline_sum += raw_value;
+            valid_samples++;
+        }
         vTaskDelay(pdMS_TO_TICKS(10));
     }
-    baseline = (float)baseline_sum / CALIBRATION_SAMPLES;
-    printf("Baseline established: %.1f\n", baseline);
+    
+    // Ensure we have at least some valid samples
+    if (valid_samples > 0) {
+        baseline = (float)baseline_sum / valid_samples;
+    } else {
+        // Default baseline if no valid readings
+        baseline = 2000.0f;
+    }
+    printf("Baseline established: %.1f (from %d samples)\n", baseline, valid_samples);
     
     // Initialize samples array with baseline value
     for (int i = 0; i < SAMPLE_COUNT; i++) {
@@ -440,8 +691,15 @@ static void microphone_task(void* arg) {
     sum = (int)baseline * SAMPLE_COUNT;
     
     while (1) {
-        // Get new sample
-        int new_value = adc1_get_raw(ADC1_CHANNEL_6);
+        // Get new sample with error handling
+        int new_value;
+        
+        // Add error handling for ADC reading
+        new_value = adc1_get_raw(ADC1_CHANNEL_6);
+        if (new_value < 0) {
+            // Invalid reading, use baseline instead
+            new_value = (int)baseline;
+        }
         
         // Update running sum: subtract oldest sample, add new sample
         sum -= samples[sample_index];
@@ -464,8 +722,10 @@ static void microphone_task(void* arg) {
             continue;
         }
         
-        // Print values (reduced to just deviation for less noise in serial output)
-        printf("Deviation: %.1f\n", deviation);
+        // Reduce serial output frequency to avoid overwhelming the system
+        if (sample_index == 0) {  // Only print once per full buffer cycle
+            printf("Deviation: %.1f\n", deviation);
+        }
         
         // Check if sound threshold is exceeded and not in cooldown
         if (deviation > SOUND_THRESHOLD && !in_cooldown) {
@@ -474,9 +734,13 @@ static void microphone_task(void* arg) {
             // Set cooldown flag
             in_cooldown = true;
             
-            // Suspend other movement tasks
-            if (randomTaskHandle != NULL) vTaskSuspend(randomTaskHandle);
-            if (voiceTaskHandle != NULL) vTaskSuspend(voiceTaskHandle);
+            // Suspend other movement tasks - with error checking
+            if (randomTaskHandle != NULL && eTaskGetState(randomTaskHandle) != eSuspended) {
+                vTaskSuspend(randomTaskHandle);
+            }
+            if (voiceTaskHandle != NULL && eTaskGetState(voiceTaskHandle) != eSuspended) {
+                vTaskSuspend(voiceTaskHandle);
+            }
             
             // Stop all movement
             motor_stop();
@@ -484,7 +748,7 @@ static void microphone_task(void* arg) {
             // React with LED and servos
             express_react();
             
-            // Resume tasks in their previous state
+            // Resume tasks in their previous state - with error checking
             if (current_mode == MODE_RANDOM && randomTaskHandle != NULL) {
                 vTaskResume(randomTaskHandle);
             } else if (current_mode == MODE_VOICE && voiceTaskHandle != NULL) {
@@ -646,13 +910,38 @@ static void echo_task(void* arg) {
 void app_main(void) {
     // 1) Hardware init
     init_led();
+    
+    // Add delay between initializations
+    vTaskDelay(pdMS_TO_TICKS(100));
+    
+    init_lcd();
+    
+    // Add delay between initializations
+    vTaskDelay(pdMS_TO_TICKS(100));
+    
     init_servo();
+    
+    // Add delay between initializations
+    vTaskDelay(pdMS_TO_TICKS(100));
+    
     init_motor();
+    
+    // Add delay between initializations
+    vTaskDelay(pdMS_TO_TICKS(100));
+    
     init_ultrasonic();
+    
+    // Add delay between initializations
+    vTaskDelay(pdMS_TO_TICKS(100));
+    
     init_microphone();
     
     // Explicitly ensure motors are stopped after initialization
     motor_stop();
+    
+    // Add delay before displaying eyes
+    vTaskDelay(pdMS_TO_TICKS(200));
+    display_normal_eyes();
 
     // 2) Start periodic ultrasonic timer (200 ms)
     const esp_timer_create_args_t targs = {
@@ -663,20 +952,21 @@ void app_main(void) {
     esp_timer_create(&targs, &tm);
     esp_timer_start_periodic(tm, 200000);
 
-    // 3) Create mode tasks
-    xTaskCreate(random_task, "MODE_RANDOM", 2048, NULL, 5, &randomTaskHandle);
+    // 3) Create mode tasks with increased stack sizes
+    xTaskCreate(random_task, "MODE_RANDOM", STANDARD_TASK_STACK_SIZE, NULL, 5, &randomTaskHandle);
     vTaskSuspend(randomTaskHandle);  // Ensure random task is suspended initially
     motor_stop();
 
-    xTaskCreate(voice_task,  "MODE_VOICE",  2048, NULL, 4, &voiceTaskHandle);
+    xTaskCreate(voice_task, "MODE_VOICE", STANDARD_TASK_STACK_SIZE, NULL, 4, &voiceTaskHandle);
     vTaskSuspend(voiceTaskHandle);  // Ensure voice task is suspended initially
 
-
-    xTaskCreate(diagnostic_task, "DIAG", 2048, NULL,  3, NULL);
+    xTaskCreate(diagnostic_task, "DIAG", STANDARD_TASK_STACK_SIZE, NULL, 3, NULL);
 
     // 4) UART & mode‐manager
-    xTaskCreate(echo_task,   "MODE_UART",   UART_TASK_STACK, NULL, 10, NULL);
+    xTaskCreate(echo_task, "MODE_UART", UART_TASK_STACK, NULL, 10, NULL);
 
     // Create microphone monitoring task (high priority to ensure quick response)
-    xTaskCreate(microphone_task, "MIC_MONITOR", 2048, NULL, 8, NULL);
+    xTaskCreate(microphone_task, "MIC_MONITOR", STANDARD_TASK_STACK_SIZE, NULL, 8, NULL);
+    
+    printf("All tasks created successfully\n");
 }
