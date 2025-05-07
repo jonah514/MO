@@ -35,7 +35,7 @@
 #define SERVO_MIN_US        500
 #define SERVO_MAX_US        2500
 #define SERVO_MAX_DEG       180
-#define SERVO_ARM_REST      90  // Default rest position (adjust after testing)
+#define SERVO_ARM_REST      165  // Default rest position (adjust after testing)
 #define SERVO_ARM_DELTA     5  // Degrees to move up/down (adjust after testing)
 
 //— motor GPIOs ——————————————————————————————————————
@@ -234,6 +234,14 @@ static void ultrasonic_timer_cb(void* arg) {
 //——— Expressive reaction on obstacle ————————————————————
 // quick LED+servo animation
 static void express_react(void) {
+    // Store original arm position to restore later
+    int original_arm_pos = SERVO_ARM_REST;
+    
+    // Raise arm by 45 degrees (subtract since servo orientation)
+    int raised_arm_pos = original_arm_pos - 35;
+    if (raised_arm_pos < 0) raised_arm_pos = 0;  // Ensure we don't go below 0
+    set_servo(SERVO_CHANNEL_3, raised_arm_pos);
+    
     // LED flash x3
     for (int i = 0; i < 3; i++) {
         gpio_set_level(GPIO_NUM_13, 1);
@@ -259,6 +267,9 @@ static void express_react(void) {
     }
     // restore center
     set_servo(SERVO_CHANNEL_1, 90);
+    
+    // Return arm to original position
+    set_servo(SERVO_CHANNEL_3, original_arm_pos);
 }
 
 //——— TASKS ———
@@ -268,7 +279,7 @@ static void express_react(void) {
 //———————————————————————————————————————————————
 
 static void random_task(void* arg) {
-    const float THRESHOLD = 10.0f;  // cm
+    const float THRESHOLD = 20.0f;  // cm
     while (1) {
         if (g_ultrasonic_cm > 0 && g_ultrasonic_cm < THRESHOLD) {
             // obstacle encountered
@@ -544,28 +555,28 @@ void app_main(void) {
     // Explicitly ensure motors are stopped after initialization
     motor_stop();
 
-    // // 2) Start periodic ultrasonic timer (200 ms)
-    // const esp_timer_create_args_t targs = {
-    //     .callback = ultrasonic_timer_cb,
-    //     .name     = "ultra_timer"
-    // };
-    // esp_timer_handle_t tm;
-    // esp_timer_create(&targs, &tm);
-    // esp_timer_start_periodic(tm, 200000);
+    // 2) Start periodic ultrasonic timer (200 ms)
+    const esp_timer_create_args_t targs = {
+        .callback = ultrasonic_timer_cb,
+        .name     = "ultra_timer"
+    };
+    esp_timer_handle_t tm;
+    esp_timer_create(&targs, &tm);
+    esp_timer_start_periodic(tm, 200000);
 
-    // // 3) Create mode tasks
-    // xTaskCreate(random_task, "MODE_RANDOM", 2048, NULL, 5, &randomTaskHandle);
-    // vTaskSuspend(randomTaskHandle);  // Ensure random task is suspended initially
-    // motor_stop();
+    // 3) Create mode tasks
+    xTaskCreate(random_task, "MODE_RANDOM", 2048, NULL, 5, &randomTaskHandle);
+    vTaskSuspend(randomTaskHandle);  // Ensure random task is suspended initially
+    motor_stop();
 
-    // xTaskCreate(voice_task,  "MODE_VOICE",  2048, NULL, 4, &voiceTaskHandle);
-    // vTaskSuspend(voiceTaskHandle);  // Ensure voice task is suspended initially
+    xTaskCreate(voice_task,  "MODE_VOICE",  2048, NULL, 4, &voiceTaskHandle);
+    vTaskSuspend(voiceTaskHandle);  // Ensure voice task is suspended initially
 
 
-    // xTaskCreate(diagnostic_task, "DIAG", 2048, NULL,  3, NULL);
+    xTaskCreate(diagnostic_task, "DIAG", 2048, NULL,  3, NULL);
 
-    // // 4) UART & mode‐manager
-    // xTaskCreate(echo_task,   "MODE_UART",   UART_TASK_STACK, NULL, 10, NULL);
+    // 4) UART & mode‐manager
+    xTaskCreate(echo_task,   "MODE_UART",   UART_TASK_STACK, NULL, 10, NULL);
 
     // Create microphone monitoring task (high priority to ensure quick response)
     xTaskCreate(microphone_task, "MIC_MONITOR", 2048, NULL, 8, NULL);
