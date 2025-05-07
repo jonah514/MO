@@ -35,7 +35,7 @@
 #define SERVO_MIN_US        500
 #define SERVO_MAX_US        2500
 #define SERVO_MAX_DEG       180
-#define SERVO_ARM_REST      165  // Default rest position (adjust after testing)
+#define SERVO_ARM_REST      90  // Default rest position (adjust after testing)
 #define SERVO_ARM_DELTA     5  // Degrees to move up/down (adjust after testing)
 
 //— motor GPIOs ——————————————————————————————————————
@@ -70,6 +70,9 @@ static volatile uint32_t obstacle_count = 0;
 //— task handles —————————————————————————————————————
 static TaskHandle_t randomTaskHandle = NULL;
 static TaskHandle_t voiceTaskHandle  = NULL;
+
+// Add a global variable to track the current arm position
+static int current_arm_position = SERVO_ARM_REST;
 
 //——— SERVO HELPERS ———
 
@@ -124,6 +127,7 @@ static void init_servo(void) {
     set_servo(SERVO_CHANNEL_1, 90);  // Center tilt
     set_servo(SERVO_CHANNEL_2, 90);  // Center pan
     set_servo(SERVO_CHANNEL_3, SERVO_ARM_REST);  // Default rest position
+    current_arm_position = SERVO_ARM_REST;
     
     printf("Servos initialized to center position\r\n");
 }
@@ -235,9 +239,9 @@ static void ultrasonic_timer_cb(void* arg) {
 // quick LED+servo animation
 static void express_react(void) {
     // Store original arm position to restore later
-    int original_arm_pos = SERVO_ARM_REST;
+    int original_arm_pos = current_arm_position;
     
-    // Raise arm by 45 degrees (subtract since servo orientation)
+    // Raise arm by 35 degrees (subtract since servo orientation)
     int raised_arm_pos = original_arm_pos - 35;
     if (raised_arm_pos < 0) raised_arm_pos = 0;  // Ensure we don't go below 0
     set_servo(SERVO_CHANNEL_3, raised_arm_pos);
@@ -272,6 +276,65 @@ static void express_react(void) {
     set_servo(SERVO_CHANNEL_3, original_arm_pos);
 }
 
+//——— Anger reaction - spin in circles and move servos ————————————————————
+static void express_anger(void) {
+    // Store original servo positions to restore later
+    int original_arm_pos = current_arm_position;
+    
+    // Stop any current movement first
+    motor_stop();
+    vTaskDelay(pdMS_TO_TICKS(200));
+    
+    // Raise arm fully
+    set_servo(SERVO_CHANNEL_3, original_arm_pos - 90);
+    
+    // Spin in circles twice (clockwise)
+    for (int circle = 0; circle < 2; circle++) {
+        // Start spinning right
+        motor_right();
+        
+        // Move servos while spinning
+        for (int pos = 30; pos <= 150; pos += 20) {
+            // Move tilt servo
+            set_servo(SERVO_CHANNEL_1, pos);
+            
+            // Move pan servo in opposite direction
+            set_servo(SERVO_CHANNEL_2, 180 - pos);
+            
+            // Flash LED
+            gpio_set_level(GPIO_NUM_13, pos % 40 < 20 ? 1 : 0);
+            
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        
+        // Move servos back while continuing to spin
+        for (int pos = 150; pos >= 30; pos -= 20) {
+            // Move tilt servo
+            set_servo(SERVO_CHANNEL_1, pos);
+            
+            // Move pan servo in opposite direction
+            set_servo(SERVO_CHANNEL_2, 180 - pos);
+            
+            // Flash LED
+            gpio_set_level(GPIO_NUM_13, pos % 40 < 20 ? 1 : 0);
+            
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        obstacle_count = 0;
+    }
+    
+    // Stop spinning
+    motor_stop();
+    
+    // Return servos to center position
+    set_servo(SERVO_CHANNEL_1, 90);
+    set_servo(SERVO_CHANNEL_2, 90);
+    set_servo(SERVO_CHANNEL_3, original_arm_pos);
+    
+    // Turn off LED
+    gpio_set_level(GPIO_NUM_13, 0);
+}
+
 //——— TASKS ———
 
 //———————————————————————————————————————————————
@@ -281,6 +344,21 @@ static void express_react(void) {
 static void random_task(void* arg) {
     const float THRESHOLD = 20.0f;  // cm
     while (1) {
+        // Check if obstacle count exceeds threshold for anger reaction
+        if (obstacle_count > 5) {
+            // Execute anger behavior
+            express_anger();
+            
+            // Reset obstacle count
+            obstacle_count = 0;
+            
+            // Send message to UART
+            uart_write_bytes(UART_PORT_NUM, "ANGER TRIGGERED: TOO MANY OBSTACLES!\r\n", 38);
+            
+            // Continue with normal operation after expressing anger
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+        
         if (g_ultrasonic_cm > 0 && g_ultrasonic_cm < THRESHOLD) {
             // obstacle encountered
             obstacle_count++;
@@ -432,13 +510,8 @@ static void microphone_task(void* arg) {
 static void diagnostic_task(void* arg) {
     char out[64];
     while (1) {
-        if (g_ultrasonic_cm < 0) {
-            snprintf(out, sizeof(out), "OBSTCNT %lu DIST ERR\r\n",
-                     obstacle_count);
-        } else {
-            snprintf(out, sizeof(out), "OBSTCNT %lu DIST %.1f\r\n",
-                     obstacle_count, g_ultrasonic_cm);
-        }
+        snprintf(out, sizeof(out), "OBSTCNT %lu\r\n", obstacle_count);
+
         uart_write_bytes(UART_PORT_NUM, out, strlen(out));
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
@@ -525,17 +598,43 @@ static void echo_task(void* arg) {
 
             // — ARM SERVO COMMANDS —
             case '7': {  // Raise arm
-                int new_pos = SERVO_ARM_REST + SERVO_ARM_DELTA;
+                int new_pos = current_arm_position + SERVO_ARM_DELTA;
                 if (new_pos > SERVO_MAX_DEG) new_pos = SERVO_MAX_DEG;
                 set_servo(SERVO_CHANNEL_3, new_pos);
-                uart_write_bytes(UART_PORT_NUM, "ARM UP\r\n", 8);
+                current_arm_position = new_pos;  // Update the current position
+                
+                char response[32];
+                snprintf(response, sizeof(response), "UP: %d\r\n", new_pos);
+                uart_write_bytes(UART_PORT_NUM, response, strlen(response));
             } break;
             
             case '8': {  // Lower arm
-                int new_pos = SERVO_ARM_REST - SERVO_ARM_DELTA;
+                int new_pos = current_arm_position - SERVO_ARM_DELTA;
                 if (new_pos < 0) new_pos = 0;
                 set_servo(SERVO_CHANNEL_3, new_pos);
-                uart_write_bytes(UART_PORT_NUM, "ARM DOWN\r\n", 10);
+                current_arm_position = new_pos;  // Update the current position
+                
+                char response[32];
+                snprintf(response, sizeof(response), "DOWN: %d\r\n", new_pos);
+                uart_write_bytes(UART_PORT_NUM, response, strlen(response));
+            } break;
+
+            // — SPECIAL COMMANDS —
+            case 'X': {  // ANGER command
+                if (current_mode == MODE_RANDOM) {
+                    // Suspend random task temporarily
+                    vTaskSuspend(randomTaskHandle);
+                    
+                    // Execute anger behavior
+                    express_anger();
+                    
+                    // Resume random task
+                    vTaskResume(randomTaskHandle);
+                    
+                    uart_write_bytes(UART_PORT_NUM, "ANGER EXPRESSED\r\n", 17);
+                } else {
+                    uart_write_bytes(UART_PORT_NUM, "ANGER IGNORED (not in random mode)\r\n", 36);
+                }
             } break;
 
             default:
