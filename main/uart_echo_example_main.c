@@ -12,6 +12,8 @@
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "sdkconfig.h"
+#include "driver/adc.h"
+#include <math.h>
 
 // UART CONFIG, DONT CHANGE
 #define UART_TX_PIN         (CONFIG_EXAMPLE_UART_TXD)
@@ -24,13 +26,17 @@
 //— pins & PWM for servo ————————————————————————————
 #define SERVO_GPIO1         GPIO_NUM_12 //tilt
 #define SERVO_GPIO2         GPIO_NUM_13 //pan
+#define SERVO_GPIO3         GPIO_NUM_14  //arm
 #define SERVO_FREQ_HZ       50
 #define SERVO_TIMER         LEDC_TIMER_0
 #define SERVO_CHANNEL_1     LEDC_CHANNEL_0
 #define SERVO_CHANNEL_2     LEDC_CHANNEL_1
+#define SERVO_CHANNEL_3     LEDC_CHANNEL_2
 #define SERVO_MIN_US        500
 #define SERVO_MAX_US        2500
 #define SERVO_MAX_DEG       180
+#define SERVO_ARM_REST      90  // Default rest position (adjust after testing)
+#define SERVO_ARM_DELTA     5  // Degrees to move up/down (adjust after testing)
 
 //— motor GPIOs ——————————————————————————————————————
 #define MOTOR_A_IN1         GPIO_NUM_7
@@ -42,6 +48,10 @@
 #define ULTRA_TRIG_PIN      GPIO_NUM_4
 #define ULTRA_ECHO_PIN      GPIO_NUM_15
 
+//— microphone pin ————————————————————————————————
+#define MIC_PIN             GPIO_NUM_34
+#define MIC_THRESHOLD       2000    // ADC raw value threshold (adjust after testing)
+#define MIC_CHECK_DELAY_MS  50      // How often to check microphone
 
 //— modes ————————————————————————————————————————
 typedef enum {
@@ -96,13 +106,14 @@ static void init_servo(void) {
     };
     ledc_timer_config(&t);
 
-    for (int ch = SERVO_CHANNEL_1; ch <= SERVO_CHANNEL_2; ch++) {
+    for (int ch = SERVO_CHANNEL_1; ch <= SERVO_CHANNEL_3; ch++) {
         ledc_channel_config_t c = {
             .speed_mode = LEDC_LOW_SPEED_MODE,
             .channel    = ch,
             .timer_sel  = SERVO_TIMER,
             .intr_type  = LEDC_INTR_DISABLE,
-            .gpio_num   = (ch == SERVO_CHANNEL_1 ? SERVO_GPIO1 : SERVO_GPIO2),
+            .gpio_num   = (ch == SERVO_CHANNEL_1 ? SERVO_GPIO1 :
+                           (ch == SERVO_CHANNEL_2 ? SERVO_GPIO2 : SERVO_GPIO3)),
             .duty       = 0,
             .hpoint     = 0
         };
@@ -112,6 +123,7 @@ static void init_servo(void) {
     // Initialize both servos to center position (90 degrees)
     set_servo(SERVO_CHANNEL_1, 90);  // Center tilt
     set_servo(SERVO_CHANNEL_2, 90);  // Center pan
+    set_servo(SERVO_CHANNEL_3, SERVO_ARM_REST);  // Default rest position
     
     printf("Servos initialized to center position\r\n");
 }
@@ -146,6 +158,12 @@ static void init_ultrasonic(void) {
     gpio_set_direction(ULTRA_ECHO_PIN, GPIO_MODE_INPUT);
 }
 
+static void init_microphone(void) {
+    // Configure ADC1 channel 6 (GPIO34)
+    adc1_config_width(ADC_WIDTH_BIT_12);
+    adc1_config_channel_atten(ADC1_CHANNEL_6, ADC_ATTEN_DB_11);
+    printf("Microphone ADC initialized\r\n");
+}
 
 //———————————————————————————————————————————————
 //— Motor primitives
@@ -223,28 +241,25 @@ static void express_react(void) {
         gpio_set_level(GPIO_NUM_13, 0);
         vTaskDelay(pdMS_TO_TICKS(100));
     }
-    // wave servo 2 out-and-back
+    // wave servo 2 out-and-back (pan)
     for (int a = 90; a <= 150; a += 10) {
         set_servo(SERVO_CHANNEL_2, a);
         vTaskDelay(pdMS_TO_TICKS(50));
     }
-    for (int a = 150; a >= 90; a -= 10) {
+    for (int a = 150; a >= 30; a -= 10) {
         set_servo(SERVO_CHANNEL_2, a);
         vTaskDelay(pdMS_TO_TICKS(50));
     }
-        // wave servo 2 out-and-back
-    for (int a = 90; a <= 150; a += 10) {
-        set_servo(SERVO_CHANNEL_1, a);
-        vTaskDelay(pdMS_TO_TICKS(50));
-    }
-    for (int a = 150; a >= 90; a -= 10) {
+    set_servo(SERVO_CHANNEL_2, 90);
+
+    // wave servo 1 out-and-back (tilt)
+    for (int a = 90; a >= 30; a -= 10) {
         set_servo(SERVO_CHANNEL_1, a);
         vTaskDelay(pdMS_TO_TICKS(50));
     }
     // restore center
-    set_servo(SERVO_CHANNEL_2, 90);
+    set_servo(SERVO_CHANNEL_1, 90);
 }
-
 
 //——— TASKS ———
 
@@ -300,6 +315,105 @@ static void voice_task(void* arg) {
     while (1) {
         // TODO: integrate microphone ISR / DMA here
         vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+static void microphone_task(void* arg) {
+    const int SAMPLE_COUNT = 10;  // Number of samples to average
+    int samples[SAMPLE_COUNT];
+    int sample_index = 0;
+    int sum = 0;
+    float baseline = 0;
+    const int CALIBRATION_SAMPLES = 100;  // Number of samples to establish baseline
+    const float SOUND_THRESHOLD = 200.0f;  // Deviation threshold for sound detection
+    bool in_cooldown = false;  // Flag to prevent multiple triggers
+    int startup_delay = 20;    // Ignore first few readings to let mic stabilize
+    
+    // Initialize array to zeros initially
+    for (int i = 0; i < SAMPLE_COUNT; i++) {
+        samples[i] = 0;
+    }
+    
+    // Establish baseline once at startup
+    printf("Calibrating baseline - please keep quiet...\n");
+    int baseline_sum = 0;
+    for (int i = 0; i < CALIBRATION_SAMPLES; i++) {
+        baseline_sum += adc1_get_raw(ADC1_CHANNEL_6);
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    baseline = (float)baseline_sum / CALIBRATION_SAMPLES;
+    printf("Baseline established: %.1f\n", baseline);
+    
+    // Initialize samples array with baseline value
+    for (int i = 0; i < SAMPLE_COUNT; i++) {
+        samples[i] = (int)baseline;
+    }
+    sum = (int)baseline * SAMPLE_COUNT;
+    
+    while (1) {
+        // Get new sample
+        int new_value = adc1_get_raw(ADC1_CHANNEL_6);
+        
+        // Update running sum: subtract oldest sample, add new sample
+        sum -= samples[sample_index];
+        sum += new_value;
+        samples[sample_index] = new_value;
+        
+        // Move to next position in circular buffer
+        sample_index = (sample_index + 1) % SAMPLE_COUNT;
+        
+        // Calculate average if we have enough samples
+        float avg = (float)sum / SAMPLE_COUNT;
+        
+        // Calculate deviation from baseline
+        float deviation = fabsf(avg - baseline);
+        
+        // Skip processing during startup delay
+        if (startup_delay > 0) {
+            startup_delay--;
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+        
+        // Print values (reduced to just deviation for less noise in serial output)
+        printf("Deviation: %.1f\n", deviation);
+        
+        // Check if sound threshold is exceeded and not in cooldown
+        if (deviation > SOUND_THRESHOLD && !in_cooldown) {
+            printf("Loud sound detected! Stopping and reacting...\n");
+            
+            // Set cooldown flag
+            in_cooldown = true;
+            
+            // Suspend other movement tasks
+            if (randomTaskHandle != NULL) vTaskSuspend(randomTaskHandle);
+            if (voiceTaskHandle != NULL) vTaskSuspend(voiceTaskHandle);
+            
+            // Stop all movement
+            motor_stop();
+            
+            // React with LED and servos
+            express_react();
+            
+            // Resume tasks in their previous state
+            if (current_mode == MODE_RANDOM && randomTaskHandle != NULL) {
+                vTaskResume(randomTaskHandle);
+            } else if (current_mode == MODE_VOICE && voiceTaskHandle != NULL) {
+                vTaskResume(voiceTaskHandle);
+            }
+            
+            // Reset cooldown flag after a longer delay to prevent multiple triggers
+            vTaskDelay(pdMS_TO_TICKS(2000));  // 2000ms cooldown
+            in_cooldown = false;
+            
+            // Reset the samples array to baseline values to avoid false triggers
+            for (int i = 0; i < SAMPLE_COUNT; i++) {
+                samples[i] = (int)baseline;
+            }
+            sum = (int)baseline * SAMPLE_COUNT;
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(50));  // 50ms delay between readings
     }
 }
 
@@ -398,6 +512,21 @@ static void echo_task(void* arg) {
                 uart_write_bytes(UART_PORT_NUM, out, strlen(out));
             } break;
 
+            // — ARM SERVO COMMANDS —
+            case '7': {  // Raise arm
+                int new_pos = SERVO_ARM_REST + SERVO_ARM_DELTA;
+                if (new_pos > SERVO_MAX_DEG) new_pos = SERVO_MAX_DEG;
+                set_servo(SERVO_CHANNEL_3, new_pos);
+                uart_write_bytes(UART_PORT_NUM, "ARM UP\r\n", 8);
+            } break;
+            
+            case '8': {  // Lower arm
+                int new_pos = SERVO_ARM_REST - SERVO_ARM_DELTA;
+                if (new_pos < 0) new_pos = 0;
+                set_servo(SERVO_CHANNEL_3, new_pos);
+                uart_write_bytes(UART_PORT_NUM, "ARM DOWN\r\n", 10);
+            } break;
+
             default:
                 break;
         }
@@ -410,30 +539,34 @@ void app_main(void) {
     init_servo();
     init_motor();
     init_ultrasonic();
+    init_microphone();
     
     // Explicitly ensure motors are stopped after initialization
     motor_stop();
 
-    // 2) Start periodic ultrasonic timer (200 ms)
-    const esp_timer_create_args_t targs = {
-        .callback = ultrasonic_timer_cb,
-        .name     = "ultra_timer"
-    };
-    esp_timer_handle_t tm;
-    esp_timer_create(&targs, &tm);
-    esp_timer_start_periodic(tm, 200000);
+    // // 2) Start periodic ultrasonic timer (200 ms)
+    // const esp_timer_create_args_t targs = {
+    //     .callback = ultrasonic_timer_cb,
+    //     .name     = "ultra_timer"
+    // };
+    // esp_timer_handle_t tm;
+    // esp_timer_create(&targs, &tm);
+    // esp_timer_start_periodic(tm, 200000);
 
-    // 3) Create mode tasks
-    xTaskCreate(random_task, "MODE_RANDOM", 2048, NULL, 5, &randomTaskHandle);
-    vTaskSuspend(randomTaskHandle);  // Ensure random task is suspended initially
-    motor_stop();
+    // // 3) Create mode tasks
+    // xTaskCreate(random_task, "MODE_RANDOM", 2048, NULL, 5, &randomTaskHandle);
+    // vTaskSuspend(randomTaskHandle);  // Ensure random task is suspended initially
+    // motor_stop();
 
-    xTaskCreate(voice_task,  "MODE_VOICE",  2048, NULL, 4, &voiceTaskHandle);
-    vTaskSuspend(voiceTaskHandle);  // Ensure voice task is suspended initially
+    // xTaskCreate(voice_task,  "MODE_VOICE",  2048, NULL, 4, &voiceTaskHandle);
+    // vTaskSuspend(voiceTaskHandle);  // Ensure voice task is suspended initially
 
 
-    xTaskCreate(diagnostic_task, "DIAG", 2048, NULL,  3, NULL);
+    // xTaskCreate(diagnostic_task, "DIAG", 2048, NULL,  3, NULL);
 
-    // 4) UART & mode‐manager
-    xTaskCreate(echo_task,   "MODE_UART",   UART_TASK_STACK, NULL, 10, NULL);
+    // // 4) UART & mode‐manager
+    // xTaskCreate(echo_task,   "MODE_UART",   UART_TASK_STACK, NULL, 10, NULL);
+
+    // Create microphone monitoring task (high priority to ensure quick response)
+    xTaskCreate(microphone_task, "MIC_MONITOR", 2048, NULL, 8, NULL);
 }
