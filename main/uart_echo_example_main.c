@@ -14,7 +14,7 @@
 #include "sdkconfig.h"
 #include "driver/adc.h"
 #include <math.h>
-#include "lcd_1602.h" // We'll create this header file
+#include "lcd_1602.h" // Created with ESP32 LCD primitives
 
 // UART CONFIG, DONT CHANGE
 #define UART_TX_PIN         (CONFIG_EXAMPLE_UART_TXD)
@@ -36,8 +36,8 @@
 #define SERVO_MIN_US        500
 #define SERVO_MAX_US        2500
 #define SERVO_MAX_DEG       180
-#define SERVO_ARM_REST      90  // Default rest position (adjust after testing)
-#define SERVO_ARM_DELTA     5  // Degrees to move up/down (adjust after testing)
+#define SERVO_ARM_REST      90  // Default rest position 
+#define SERVO_ARM_DELTA     10
 
 //— motor GPIOs ——————————————————————————————————————
 #define MOTOR_A_IN1         GPIO_NUM_7
@@ -126,10 +126,6 @@ const uint8_t MIDDLE_LINE[8] = {
 static void display_normal_eyes(void) {
     lcd_clear();
     vTaskDelay(pdMS_TO_TICKS(20));
-    
-    // First row - both eyes
-    // We have 16 columns total, with 5 blocks per eye = 10 blocks
-    // That leaves 6 spaces to distribute: 1 at start, 4 between eyes, 1 at end
     
     // Left eye (first row)
     lcd_set_cursor(1, 0);
@@ -251,7 +247,7 @@ static void display_closed_eyes(void) {
     }
 }
 
-// Function to perform a natural blink animation
+// staged natural blink animation
 static void blink_eyes(void) {
     // Half-closed eyes
     display_half_closed_eyes();
@@ -267,36 +263,6 @@ static void blink_eyes(void) {
     
     // Back to normal
     display_normal_eyes();
-}
-
-static void display_angry_eyes(void) {
-    display_normal_eyes();
-}
-
-// Function to initialize the LCD
-static void init_lcd(void) {
-    // Add a delay before initialization to ensure power is stable
-    vTaskDelay(pdMS_TO_TICKS(200));
-    
-    // Initialize LCD in 4-bit mode
-    lcd_init(LCD_RS_PIN, LCD_E_PIN, LCD_D4_PIN, LCD_D5_PIN, LCD_D6_PIN, LCD_D7_PIN);
-    
-    // Add a longer delay after initialization
-    vTaskDelay(pdMS_TO_TICKS(300));
-    
-    // Create custom characters with longer delays between operations
-    lcd_create_char(0, FULL_BLOCK);   // Full block for normal eyes
-    vTaskDelay(pdMS_TO_TICKS(50));
-    lcd_create_char(1, EMPTY_BLOCK);  // Empty block for closed eyes
-    vTaskDelay(pdMS_TO_TICKS(50));
-    lcd_create_char(2, MIDDLE_LINE);  // Middle line for half-closed eyes
-    vTaskDelay(pdMS_TO_TICKS(50));
-    
-    // Clear display and home cursor
-    lcd_clear();
-    vTaskDelay(pdMS_TO_TICKS(50));
-    
-    printf("LCD initialization complete\n");
 }
 
 //——— SERVO HELPERS ———
@@ -394,6 +360,32 @@ static void init_microphone(void) {
     printf("Microphone ADC initialized\r\n");
 }
 
+// Function to initialize the LCD
+static void init_lcd(void) {
+    // Add a delay before initialization to ensure power is stable
+    vTaskDelay(pdMS_TO_TICKS(200));
+    
+    // Initialize LCD in 4-bit mode
+    lcd_init(LCD_RS_PIN, LCD_E_PIN, LCD_D4_PIN, LCD_D5_PIN, LCD_D6_PIN, LCD_D7_PIN);
+    
+    // Add a longer delay after initialization
+    vTaskDelay(pdMS_TO_TICKS(300));
+    
+    // Create custom characters with longer delays between operations
+    lcd_create_char(0, FULL_BLOCK);   // Full block for normal eyes
+    vTaskDelay(pdMS_TO_TICKS(50));
+    lcd_create_char(1, EMPTY_BLOCK);  // Empty block for closed eyes
+    vTaskDelay(pdMS_TO_TICKS(50));
+    lcd_create_char(2, MIDDLE_LINE);  // Middle line for half-closed eyes
+    vTaskDelay(pdMS_TO_TICKS(50));
+    
+    // Clear display and home cursor
+    lcd_clear();
+    vTaskDelay(pdMS_TO_TICKS(50));
+    
+    printf("LCD initialization complete\n");
+}
+
 //———————————————————————————————————————————————
 //— Motor primitives
 //———————————————————————————————————————————————
@@ -464,13 +456,14 @@ static void ultrasonic_timer_cb(void* arg) {
 // quick LED+servo animation
 static void express_react(void) {
     // Store original arm position to restore later
+    current_arm_position = SERVO_ARM_REST;
     int original_arm_pos = current_arm_position;
     
     // Show surprised eyes
     display_normal_eyes();
     
     // Raise arm by 35 degrees (subtract since servo orientation)
-    int raised_arm_pos = original_arm_pos - 35;
+    int raised_arm_pos = original_arm_pos - 60;
     if (raised_arm_pos < 0) raised_arm_pos = 0;  // Ensure we don't go below 0
     set_servo(SERVO_CHANNEL_3, raised_arm_pos);
     
@@ -505,13 +498,11 @@ static void express_react(void) {
     set_servo(SERVO_CHANNEL_1, 90);
     
     // Return arm to original position
-    set_servo(SERVO_CHANNEL_3, original_arm_pos);
+    set_servo(SERVO_CHANNEL_3, SERVO_ARM_REST);
 }
 
 //——— Anger reaction - spin in circles and move servos ————————————————————
 static void express_anger(void) {
-    // Show angry eyes
-    display_angry_eyes();
     
     // Store original servo positions to restore later
     int original_arm_pos = current_arm_position;
@@ -527,34 +518,8 @@ static void express_anger(void) {
     for (int circle = 0; circle < 2; circle++) {
         // Start spinning right
         motor_right();
-        
-        // Move servos while spinning
-        for (int pos = 30; pos <= 150; pos += 20) {
-            // Move tilt servo
-            set_servo(SERVO_CHANNEL_1, pos);
-            
-            // Move pan servo in opposite direction
-            set_servo(SERVO_CHANNEL_2, 180 - pos);
-            
-            // Flash LED
-            gpio_set_level(GPIO_NUM_13, pos % 40 < 20 ? 1 : 0);
-            
-            vTaskDelay(pdMS_TO_TICKS(100));
-        }
-        
-        // Move servos back while continuing to spin
-        for (int pos = 150; pos >= 30; pos -= 20) {
-            // Move tilt servo
-            set_servo(SERVO_CHANNEL_1, pos);
-            
-            // Move pan servo in opposite direction
-            set_servo(SERVO_CHANNEL_2, 180 - pos);
-            
-            // Flash LED
-            gpio_set_level(GPIO_NUM_13, pos % 40 < 20 ? 1 : 0);
-            
-            vTaskDelay(pdMS_TO_TICKS(100));
-        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
         obstacle_count = 0;
     }
     
@@ -633,7 +598,7 @@ static void random_task(void* arg) {
 }
 
 //———————————————————————————————————————————————
-//— Voice-mode task (priority 4) NOT FINISHED
+//— Voice-mode task (priority 4) NOT FINISHED, will implement peak/trough detection for basic commands
 //———————————————————————————————————————————————
 
 static void voice_task(void* arg) {
@@ -911,29 +876,20 @@ void app_main(void) {
     // 1) Hardware init
     init_led();
     
-    // Add delay between initializations
+    // delays between initializations
     vTaskDelay(pdMS_TO_TICKS(100));
-    
     init_lcd();
     
-    // Add delay between initializations
     vTaskDelay(pdMS_TO_TICKS(100));
-    
     init_servo();
     
-    // Add delay between initializations
     vTaskDelay(pdMS_TO_TICKS(100));
-    
     init_motor();
     
-    // Add delay between initializations
     vTaskDelay(pdMS_TO_TICKS(100));
-    
     init_ultrasonic();
     
-    // Add delay between initializations
     vTaskDelay(pdMS_TO_TICKS(100));
-    
     init_microphone();
     
     // Explicitly ensure motors are stopped after initialization
